@@ -1,0 +1,118 @@
+import { NextRequest, NextResponse } from "next/server";
+import { getGoogleMapsServerApiKey, normalizePlaceSummary } from "@/lib/googlePlaces";
+
+const GOOGLE_PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText";
+const FIELD_MASK =
+  "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.priceLevel,places.currentOpeningHours,places.photos,places.primaryType,places.types,nextPageToken";
+
+async function searchPlaces(params: {
+  lat: number;
+  lng: number;
+  radius: number;
+  textQuery: string;
+}) {
+  const response = await fetch(GOOGLE_PLACES_SEARCH_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": getGoogleMapsServerApiKey(),
+      "X-Goog-FieldMask": FIELD_MASK,
+    },
+    body: JSON.stringify({
+      textQuery: params.textQuery,
+      locationBias: {
+        circle: {
+          center: {
+            latitude: params.lat,
+            longitude: params.lng,
+          },
+          radius: params.radius,
+        },
+      },
+      maxResultCount: 20,
+    }),
+    next: { revalidate: 300 },
+    signal: AbortSignal.timeout(3500),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Google Places search failed: ${errorText}`);
+  }
+
+  const data = await response.json();
+  return {
+    places: Array.isArray(data?.places) ? data.places.map(normalizePlaceSummary) : [],
+    nextPageToken: typeof data?.nextPageToken === "string" ? data.nextPageToken : null,
+  };
+}
+
+async function getNextPage(nextPageToken: string) {
+  await new Promise((resolve) => setTimeout(resolve, 2000));
+
+  const response = await fetch(GOOGLE_PLACES_SEARCH_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "X-Goog-Api-Key": getGoogleMapsServerApiKey(),
+      "X-Goog-FieldMask": FIELD_MASK,
+    },
+    body: JSON.stringify({ pageToken: nextPageToken }),
+    next: { revalidate: 300 },
+    signal: AbortSignal.timeout(3500),
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Google Places next page failed: ${errorText}`);
+  }
+
+  const data = await response.json();
+  return {
+    places: Array.isArray(data?.places) ? data.places.map(normalizePlaceSummary) : [],
+    nextPageToken: typeof data?.nextPageToken === "string" ? data.nextPageToken : null,
+  };
+}
+
+export async function POST(request: NextRequest) {
+  try {
+    const body = await request.json();
+    const {
+      lat,
+      lng,
+      radius = 5000,
+      keyword,
+      textQuery,
+      nextPageToken,
+    } = body as {
+      lat?: number;
+      lng?: number;
+      radius?: number;
+      keyword?: string;
+      textQuery?: string;
+      nextPageToken?: string;
+    };
+
+    if (nextPageToken) {
+      const result = await getNextPage(nextPageToken);
+      return NextResponse.json(result);
+    }
+
+    if (typeof lat !== "number" || typeof lng !== "number") {
+      return NextResponse.json({ error: "Location is required" }, { status: 400 });
+    }
+
+    const result = await searchPlaces({
+      lat,
+      lng,
+      radius,
+      textQuery: textQuery || keyword || "restaurant",
+    });
+
+    return NextResponse.json(result);
+  } catch (error: unknown) {
+    const message = error instanceof Error ? error.message : "Internal server error";
+    console.error("Places proxy error:", message);
+    return NextResponse.json({ error: message }, { status: 500 });
+  }
+}

@@ -1,0 +1,431 @@
+"use client";
+
+import { useState, useRef, useEffect, useMemo, useLayoutEffect } from "react";
+import { useChatContext } from "@/context/ChatContext";
+import { usePlaceContext } from "@/context/PlaceContext";
+import { useLocationContext } from "@/context/LocationContext";
+import PlaceList from "./PlaceList";
+import PlaceDetail from "./PlaceDetail";
+import { Place } from "@/types/chat";
+import { distanceLabel } from "@/lib/distance";
+
+interface ChatProps {
+  onPlaceSelected?: (place: Place | null) => void;
+  onPlaceHover?: (place: Place | null) => void;
+  onMapPlacesChange?: (places: Place[]) => void;
+}
+
+export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange }: ChatProps) {
+  const { messages, isLoading, error, recommendedPlaces, allPlaces, sendMessage, nextPageToken, loadMorePlaces, loadMoreRecommendations } = useChatContext();
+  const { selectedPlace, selectPlace, setSelectedPlace } = usePlaceContext();
+  const { location } = useLocationContext();
+  const [input, setInput] = useState("");
+  const [hoveredPlace, setHoveredPlace] = useState<Place | null>(null);
+  const [expandedReasons, setExpandedReasons] = useState<Record<string, boolean>>({});
+  const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const ReasonText = ({
+    text,
+    expanded,
+    onToggle,
+  }: {
+    text: string;
+    expanded: boolean;
+    onToggle: () => void;
+  }) => {
+    const pRef = useRef<HTMLParagraphElement | null>(null);
+    const [canExpand, setCanExpand] = useState(false);
+
+    useLayoutEffect(() => {
+      const el = pRef.current;
+      if (!el) return;
+      if (expanded) {
+        setCanExpand(true);
+        return;
+      }
+      // Wait for layout; then check overflow under line-clamp.
+      const raf = requestAnimationFrame(() => {
+        setCanExpand(el.scrollHeight > el.clientHeight + 1);
+      });
+      return () => cancelAnimationFrame(raf);
+    }, [text, expanded]);
+
+    return (
+      <div className="mt-1">
+        <p
+          ref={pRef}
+          className={`text-xs text-gray-500 leading-relaxed ${expanded ? "" : "line-clamp-2"}`}
+          title={text}
+        >
+          {text}
+        </p>
+        <div className="mt-1 h-6">
+          {canExpand && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onToggle();
+              }}
+              className="inline-flex items-center gap-1 rounded-full px-2 py-1 text-[11px] font-semibold text-gray-600 hover:text-gray-900 hover:bg-gray-100 transition-colors"
+            >
+              <span>{expanded ? "收起" : "展开"}</span>
+              <svg
+                viewBox="0 0 20 20"
+                fill="currentColor"
+                className={`h-3 w-3 transition-transform ${expanded ? "rotate-180" : ""}`}
+                aria-hidden="true"
+              >
+                <path
+                  fillRule="evenodd"
+                  d="M5.23 7.21a.75.75 0 0 1 1.06.02L10 10.94l3.71-3.71a.75.75 0 1 1 1.06 1.06l-4.24 4.24a.75.75 0 0 1-1.06 0L5.21 8.29a.75.75 0 0 1 .02-1.08z"
+                  clipRule="evenodd"
+                />
+              </svg>
+            </button>
+          )}
+        </div>
+      </div>
+    );
+  };
+
+  // 构建地点映射，用于根据 recommendation ID 获取完整数据
+  // 使用 allPlaces 确保历史消息的卡片也能正确渲染
+  const placesMap = useMemo(() => {
+    const map = new Map<string, Place>();
+    allPlaces.forEach(place => map.set(place.id, place));
+    return map;
+  }, [allPlaces]);
+
+  const resolvePlacesForRecommendations = useMemo(() => {
+    return (recommendations: { id: string }[] | undefined): Place[] => {
+      if (!recommendations || recommendations.length === 0) return [];
+      const resolved: Place[] = [];
+      for (const rec of recommendations) {
+        let place = placesMap.get(rec.id);
+        if (!place) {
+          const recIdLower = rec.id.toLowerCase();
+          for (const p of allPlaces) {
+            const pName = p.name || "";
+            const pNameLower = pName.toLowerCase();
+            if (
+              pNameLower.includes(recIdLower) ||
+              recIdLower.includes(pNameLower) ||
+              pName === rec.id ||
+              rec.id === pName
+            ) {
+              place = p;
+              break;
+            }
+          }
+        }
+        if (place) resolved.push(place);
+      }
+      return resolved;
+    };
+  }, [allPlaces, placesMap]);
+
+  useEffect(() => {
+    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+  }, [messages, recommendedPlaces, selectedPlace]);
+
+  // Notify parent when selectedPlace changes
+  useEffect(() => {
+    if (onPlaceSelected) {
+      onPlaceSelected(selectedPlace);
+    }
+  }, [selectedPlace, onPlaceSelected]);
+
+  // Notify parent when hoveredPlace changes
+  useEffect(() => {
+    if (onPlaceHover) {
+      onPlaceHover(hoveredPlace);
+    }
+  }, [hoveredPlace, onPlaceHover]);
+
+  useEffect(() => {
+    onMapPlacesChange?.(recommendedPlaces);
+  }, [onMapPlacesChange, recommendedPlaces]);
+
+  const handleSubmit = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!input.trim() || isLoading) return;
+
+    const userInput = input.trim();
+    setInput("");
+
+    await sendMessage(userInput);
+  };
+
+  const handlePlaceClick = async (place: Place) => {
+    console.log("[Chat] handlePlaceClick called:", place.name);
+    await selectPlace(place);
+    console.log("[Chat] After selectPlace, selectedPlace:", selectedPlace?.name);
+  };
+
+  const handleCloseDetail = () => {
+    setSelectedPlace(null);
+  };
+
+  // Show detail drawer when a place is selected
+  if (selectedPlace) {
+    return (
+      <div className="w-1/2 h-full bg-white flex flex-col">
+        <PlaceDetail place={selectedPlace} onClose={handleCloseDetail} />
+      </div>
+    );
+  }
+
+  return (
+    <div className="w-1/2 h-full bg-white flex flex-col">
+      {/* Header */}
+      <div className="h-14 border-b border-gray-200 flex items-center px-4">
+        <h1 className="text-xl font-semibold">P-Person Travel Assistant</h1>
+      </div>
+
+      {/* Chat Area */}
+      <div className="flex-1 overflow-y-auto p-4" style={{ scrollbarGutter: "stable" }}>
+        {messages.map((message) => (
+          (() => {
+            const hasRecs = message.role === "assistant" && message.recommendations && message.recommendations.length > 0;
+            const suggestionPool = ["更近一点", "预算更低", "更安静", "想坐露台", "换一批"];
+            const hash = (s: string) => {
+              let h = 0;
+              for (let i = 0; i < s.length; i++) h = (h * 31 + s.charCodeAt(i)) | 0;
+              return h;
+            };
+            const pickSuggestions = (seed: string): string[] => {
+              const h = Math.abs(hash(seed || "seed"));
+              const count = 2 + (h % 2); // 2-3
+              const start = h % suggestionPool.length;
+              const out: string[] = [];
+              for (let i = 0; i < suggestionPool.length && out.length < count; i++) {
+                const v = suggestionPool[(start + i) % suggestionPool.length];
+                if (!out.includes(v)) out.push(v);
+              }
+              return out;
+            };
+            const suggestions = hasRecs ? pickSuggestions(message.id) : [];
+            const batchPlaces = hasRecs ? resolvePlacesForRecommendations(message.recommendations) : [];
+            return (
+          <div
+            key={message.id}
+            className={`flex ${message.role === "user" ? "justify-end" : "justify-start"} mb-4`}
+          >
+            <div
+              className={`${hasRecs ? "w-full max-w-full" : "max-w-[80%]"} rounded-lg p-3 ${
+                message.role === "user"
+                  ? "bg-blue-500 text-white"
+                  : "bg-gray-100 text-gray-800"
+              }`}
+            >
+              <p className="whitespace-pre-wrap">{message.content}</p>
+
+              {/* 嵌入消息内的推荐卡片 - 纵向列表布局 */}
+              {message.role === "assistant" && message.recommendations && message.recommendations.length > 0 && (
+                <div className="mt-3 -mx-3 -mb-3">
+                  <div
+                    className="flex flex-col gap-3 p-3 bg-gray-50 rounded-b-lg"
+                    onMouseEnter={() => {
+                      onMapPlacesChange?.(batchPlaces);
+                    }}
+                    onMouseLeave={() => {
+                      setHoveredPlace(null);
+                      onPlaceHover?.(null);
+                      onMapPlacesChange?.(recommendedPlaces);
+                    }}
+                  >
+                    {message.recommendations.map((rec) => {
+                      // 容错匹配：先尝试 ID，再尝试模糊名称
+                      let place = placesMap.get(rec.id);
+                      if (!place) {
+                        // 模糊匹配：大小写不敏感 + 双向包含
+                        const recIdLower = rec.id.toLowerCase();
+                        for (const p of allPlaces) {
+                          const pName = p.name || "";
+                          const pNameLower = pName.toLowerCase();
+                          if (
+                            pNameLower.includes(recIdLower) ||
+                            recIdLower.includes(pNameLower) ||
+                            pName === rec.id ||
+                            rec.id === pName
+                          ) {
+                            place = p;
+                            break;
+                          }
+                        }
+                      }
+                      if (!place) return null;
+                      const dist = distanceLabel(location, place.location);
+                      const expandKey = `${message.id}:${rec.id}`;
+                      const expanded = !!expandedReasons[expandKey];
+
+                      return (
+                        <div
+                          key={rec.id}
+                          onClick={() => handlePlaceClick(place)}
+                          onMouseEnter={() => {
+                            setHoveredPlace(place);
+                            onPlaceHover?.(place);
+                          }}
+                          className="w-full flex gap-3 p-2 bg-white rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
+                        >
+                          {/* 左侧图片 */}
+                          <div className="w-24 h-24 flex-shrink-0 bg-gray-200 rounded-lg overflow-hidden">
+                            {place.photos && place.photos.length > 0 ? (
+                              <img
+                                src={place.photos[0]}
+                                alt={place.name}
+                                className="w-full h-full object-cover"
+                                onError={(e) => {
+                                  (e.target as HTMLImageElement).src = "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='96' height='96'%3E%3Crect fill='%23E5E7EB' width='96' height='96'/%3E%3Ctext fill='%239CA3AF' x='50%25' y='50%25' text-anchor='middle' dy='.3em' font-size='12'%3E无图%3C/text%3E%3C/svg%3E";
+                                }}
+                              />
+                            ) : (
+                              <div className="w-full h-full flex items-center justify-center text-gray-400 text-xs">
+                                无图
+                              </div>
+                            )}
+                          </div>
+
+                          {/* 右侧内容 */}
+                            <div className="flex-1 min-w-0">
+                              <div className="flex items-center gap-2 min-w-0">
+                                <p className="text-sm font-medium text-gray-900 truncate">{place.name}</p>
+                                {place.openNow === true && (
+                                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
+                                    <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+                                    营业中
+                                  </span>
+                                )}
+                                {place.openNow === false && (
+                                  <span className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-[11px] font-semibold text-rose-700">
+                                    <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
+                                    已打烊
+                                  </span>
+                                )}
+                              </div>
+                              <div className="flex items-center gap-1 mt-1">
+                                <span className="text-yellow-500 text-xs">
+                                  {"★".repeat(Math.floor(place.rating))}
+                                </span>
+                                <span className="text-xs text-gray-400">
+                                  {place.rating.toFixed(1)} ({place.userRatingsTotal})
+                                </span>
+                                {place.priceLevel && (
+                                  <span className="text-xs text-green-600 ml-1">
+                                    {"$".repeat(place.priceLevel)}
+                                  </span>
+                                )}
+                                {dist && (
+                                  <span className="ml-auto inline-flex items-center gap-1 text-xs text-gray-500 font-medium">
+                                    <span aria-hidden>📍</span>
+                                    <span>{dist}</span>
+                                  </span>
+                                )}
+                              </div>
+                              {rec.reason ? (
+                                <ReasonText
+                                  text={rec.reason}
+                                  expanded={expanded}
+                                  onToggle={() =>
+                                    setExpandedReasons((prev) => ({
+                                      ...prev,
+                                      [expandKey]: !prev[expandKey],
+                                    }))
+                                  }
+                                />
+                              ) : (
+                                <div className="mt-2 space-y-1.5 animate-pulse">
+                                  <div className="h-3 bg-gray-200 rounded w-11/12" />
+                                  <div className="h-3 bg-gray-200 rounded w-8/12" />
+                                </div>
+                              )}
+                            </div>
+                          </div>
+                        );
+                      })}
+
+                    {/* 换一批按钮 - 从已有地点中选择不同的推荐 */}
+                    {allPlaces.length > 0 && allPlaces.length > recommendedPlaces.length && (
+                      <button
+                        onClick={() => {
+                          // 获取已推荐的地点 ID
+                          const excludeIds = recommendedPlaces.map(p => p.id);
+                          loadMoreRecommendations(allPlaces, excludeIds);
+                        }}
+                        disabled={isLoading}
+                        className="w-full py-3 mt-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                      >
+                        {isLoading ? "加载中..." : "换一批"}
+                      </button>
+                    )}
+
+                    {/* Follow-up guidance */}
+                    {suggestions.length > 0 && (
+                      <p className="mt-2 text-xs text-gray-500 leading-relaxed">
+                        想继续缩小范围的话，可以直接追加一句条件，比如：{suggestions.join(" / ")}。
+                      </p>
+                    )}
+                  </div>
+                </div>
+              )}
+            </div>
+          </div>
+            );
+          })()
+        ))}
+
+        {isLoading && (
+          <div className="flex justify-start">
+            <div className="bg-gray-100 rounded-lg p-3">
+              <div className="flex gap-1">
+                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "0ms" }} />
+                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "150ms" }} />
+                <span className="w-2 h-2 bg-gray-400 rounded-full animate-bounce" style={{ animationDelay: "300ms" }} />
+              </div>
+            </div>
+          </div>
+        )}
+
+        {error && (
+          <div className="flex justify-center">
+            <div className="bg-red-50 border border-red-200 rounded-lg p-3 text-sm text-red-600">
+              {error}
+            </div>
+          </div>
+        )}
+
+        {/* Recommended Places - 只在消息内没有推荐卡片时显示 */}
+        {!messages.some(m => m.role === "assistant" && m.recommendations && m.recommendations.length > 0) && (
+          <PlaceList
+            places={recommendedPlaces}
+            onPlaceClick={handlePlaceClick}
+            onPlaceHover={setHoveredPlace}
+          />
+        )}
+
+        <div ref={messagesEndRef} />
+      </div>
+
+      {/* Input Area */}
+      <form onSubmit={handleSubmit} className="h-16 border-t border-gray-200 flex items-center px-4 gap-2">
+        <input
+          type="text"
+          value={input}
+          onChange={(e) => setInput(e.target.value)}
+          placeholder="输入你的位置或需求..."
+          className="flex-1 h-10 px-4 border border-gray-300 rounded-full focus:outline-none focus:border-blue-500"
+          disabled={isLoading}
+        />
+        <button
+          type="submit"
+          disabled={!input.trim() || isLoading}
+          className="h-10 px-4 bg-blue-500 text-white rounded-full hover:bg-blue-600 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed"
+        >
+          发送
+        </button>
+      </form>
+    </div>
+  );
+}
