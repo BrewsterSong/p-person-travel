@@ -1,6 +1,7 @@
 "use client";
 
 import { useState, useRef, useEffect, useMemo, useLayoutEffect } from "react";
+import { useAuthContext } from "@/context/AuthContext";
 import { useChatContext } from "@/context/ChatContext";
 import { usePlaceContext } from "@/context/PlaceContext";
 import { useLocationContext } from "@/context/LocationContext";
@@ -17,11 +18,13 @@ interface ChatProps {
 
 export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange }: ChatProps) {
   const { messages, isLoading, error, recommendedPlaces, allPlaces, sendMessage, nextPageToken, loadMorePlaces, loadMoreRecommendations } = useChatContext();
+  const { isConfigured, isLoading: isAuthLoading, user, signInWithGoogle, signOut } = useAuthContext();
   const { selectedPlace, selectPlace, setSelectedPlace } = usePlaceContext();
   const { location } = useLocationContext();
   const [input, setInput] = useState("");
   const [hoveredPlace, setHoveredPlace] = useState<Place | null>(null);
   const [expandedReasons, setExpandedReasons] = useState<Record<string, boolean>>({});
+  const [authError, setAuthError] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const ReasonText = ({
@@ -167,6 +170,36 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
     setSelectedPlace(null);
   };
 
+  const displayName =
+    user?.user_metadata?.full_name ||
+    user?.user_metadata?.name ||
+    user?.email ||
+    "Traveler";
+  const avatarUrl =
+    user?.user_metadata?.avatar_url ||
+    user?.user_metadata?.picture ||
+    null;
+
+  const handleGoogleSignIn = async () => {
+    setAuthError(null);
+    try {
+      await signInWithGoogle();
+    } catch (signInError) {
+      console.error("[auth] Google sign-in failed:", signInError);
+      setAuthError("Google 登录失败，请稍后再试。");
+    }
+  };
+
+  const handleSignOut = async () => {
+    setAuthError(null);
+    try {
+      await signOut();
+    } catch (signOutError) {
+      console.error("[auth] Sign-out failed:", signOutError);
+      setAuthError("退出登录失败，请稍后再试。");
+    }
+  };
+
   // Show detail drawer when a place is selected
   if (selectedPlace) {
     return (
@@ -179,8 +212,59 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
   return (
     <div className="min-h-0 flex-1 bg-white flex flex-col md:h-full">
       {/* Header */}
-      <div className="h-12 shrink-0 border-b border-gray-200 flex items-center px-3 md:h-14 md:px-4">
-        <h1 className="text-lg font-semibold md:text-xl">P-Person Travel Assistant</h1>
+      <div className="shrink-0 border-b border-gray-200 px-3 py-2 md:px-4 md:py-3">
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <h1 className="text-lg font-semibold md:text-xl">P-Person Travel Assistant</h1>
+            <p className="text-xs text-gray-500">随时随地找到下一站去哪里</p>
+          </div>
+
+          {isConfigured ? (
+            user ? (
+              <div className="flex items-center gap-2">
+                <div className="hidden text-right md:block">
+                  <p className="text-sm font-medium text-gray-900">{String(displayName)}</p>
+                  <p className="text-xs text-gray-500">已连接 Google</p>
+                </div>
+                <div className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-full bg-gray-100 text-sm font-semibold text-gray-700">
+                  {avatarUrl ? (
+                    <div
+                      aria-label={String(displayName)}
+                      className="h-full w-full bg-cover bg-center"
+                      role="img"
+                      style={{ backgroundImage: `url(${String(avatarUrl)})` }}
+                    />
+                  ) : (
+                    String(displayName).slice(0, 1).toUpperCase()
+                  )}
+                </div>
+                <button
+                  type="button"
+                  onClick={handleSignOut}
+                  className="rounded-full border border-gray-200 px-3 py-2 text-xs font-medium text-gray-700 transition hover:bg-gray-50"
+                >
+                  退出
+                </button>
+              </div>
+            ) : (
+              <button
+                type="button"
+                onClick={handleGoogleSignIn}
+                disabled={isAuthLoading}
+                className="rounded-full bg-gray-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                {isAuthLoading ? "加载中..." : "Continue with Google"}
+              </button>
+            )
+          ) : (
+            <span className="rounded-full border border-amber-200 bg-amber-50 px-3 py-1.5 text-xs font-medium text-amber-700">
+              待配置 Supabase
+            </span>
+          )}
+        </div>
+        {authError && (
+          <p className="mt-2 text-xs text-red-500">{authError}</p>
+        )}
       </div>
 
       {/* Chat Area */}

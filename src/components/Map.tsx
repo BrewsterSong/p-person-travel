@@ -533,7 +533,7 @@ export default function Map({
 
         <h3 className="mb-2 text-center text-lg font-semibold text-gray-800 md:text-xl">此区域暂不提供服务</h3>
         <p className="mb-4 max-w-xs text-center text-sm text-gray-600 md:text-base">
-          目前仅支持泰国和日本地区
+          目前支持泰国、日本、香港、越南和韩国
         </p>
 
         <div className="max-w-sm rounded-lg bg-white p-4 shadow-md">

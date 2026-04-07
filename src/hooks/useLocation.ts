@@ -16,43 +16,52 @@ export interface LocationState {
   isInServiceArea: boolean;
 }
 
-// Thailand and Japan bounds (rough bounding boxes)
-const THAILAND_BOUNDS = {
-  north: 20.5,
-  south: 5.5,
-  east: 105.9,
-  west: 97.3,
-};
-
-const JAPAN_BOUNDS = {
-  north: 45.5,
-  south: 24.0,
-  east: 146.0,
-  west: 122.0,
-};
+// Supported service regions (rough bounding boxes)
+const SUPPORTED_REGION_BOUNDS = [
+  {
+    name: "Thailand",
+    north: 20.5,
+    south: 5.5,
+    east: 105.9,
+    west: 97.3,
+  },
+  {
+    name: "Japan",
+    north: 45.5,
+    south: 24.0,
+    east: 146.0,
+    west: 122.0,
+  },
+  {
+    name: "Hong Kong",
+    north: 22.6,
+    south: 22.15,
+    east: 114.5,
+    west: 113.8,
+  },
+  {
+    name: "Vietnam",
+    north: 23.5,
+    south: 8.0,
+    east: 109.8,
+    west: 102.0,
+  },
+  {
+    name: "South Korea",
+    north: 38.7,
+    south: 33.0,
+    east: 131.0,
+    west: 124.5,
+  },
+];
 
 function isInServiceArea(lat: number, lng: number): boolean {
-  // Check Thailand
-  if (
-    lat >= THAILAND_BOUNDS.south &&
-    lat <= THAILAND_BOUNDS.north &&
-    lng >= THAILAND_BOUNDS.west &&
-    lng <= THAILAND_BOUNDS.east
-  ) {
-    return true;
-  }
-
-  // Check Japan
-  if (
-    lat >= JAPAN_BOUNDS.south &&
-    lat <= JAPAN_BOUNDS.north &&
-    lng >= JAPAN_BOUNDS.west &&
-    lng <= JAPAN_BOUNDS.east
-  ) {
-    return true;
-  }
-
-  return false;
+  return SUPPORTED_REGION_BOUNDS.some((region) =>
+    lat >= region.south &&
+    lat <= region.north &&
+    lng >= region.west &&
+    lng <= region.east
+  );
 }
 
 // Default fallback location (Bangkok)
