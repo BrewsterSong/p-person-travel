@@ -30,8 +30,6 @@ export default function Map({
   hoveredPlace = null,
   zoom = 14,
 }: MapProps) {
-  console.log("[Map] Rendering - selectedPlace:", selectedPlace?.name || null, "hoveredPlace:", hoveredPlace?.name || null);
-
   const mapRef = useRef<HTMLDivElement>(null);
   const mapInstance = useRef<google.maps.Map | null>(null);
   // Google Maps runtime APIs and published typings are inconsistent in this project.
@@ -56,6 +54,7 @@ export default function Map({
     WALKING?: RouteInfo;
     TRANSIT?: RouteInfo;
   }>({});
+  const hasRenderablePlaces = places.some((place) => place.location?.lat && place.location?.lng);
 
   const googleTravelMode = useCallback((mode: "DRIVING" | "WALKING" | "TRANSIT") => {
     if (mode === "WALKING") return "walking";
@@ -234,11 +233,8 @@ export default function Map({
 
   // Request route when a place is selected - using Google Maps DirectionsService
   useEffect(() => {
-    console.log("[Map] Route useEffect - selectedPlace:", selectedPlace?.name || "null", "location:", location ? "exists" : "null", "isLoaded:", isLoaded);
-
     // Wait for map to be loaded
     if (!isLoaded) {
-      console.log("[Map] Map not loaded yet, skipping");
       return;
     }
 
@@ -256,21 +252,16 @@ export default function Map({
 
     // Check if we have valid coordinates
     if (!selectedPlace.location?.lat || !selectedPlace.location?.lng) {
-      console.log("[Map] ❌ Selected place has NO lat/lng");
       return;
     }
 
     if (!location) {
-      console.log("[Map] ❌ No user location available");
       return;
     }
 
     if (!directionsServiceRef.current || !directionsRendererRef.current) {
-      console.log("[Map] ❌ Directions service not ready");
       return;
     }
-
-    console.log("[Map] ✅ Requesting route to:", selectedPlace.name, "from:", location.lat, location.lng);
 
     // Fetch routes for all travel modes
     const modes: Array<"DRIVING" | "WALKING" | "TRANSIT"> = ["DRIVING", "WALKING", "TRANSIT"];
@@ -515,7 +506,7 @@ export default function Map({
   }
 
   // Show empty state when not in service area
-  if (!isInServiceArea && location) {
+  if (!isInServiceArea && location && !selectedPlace && !hasRenderablePlaces) {
     return (
       <div className="flex h-full w-full flex-col items-center justify-center bg-gray-100 px-4 py-6 md:px-6 md:py-8">
         <div className="relative mb-4 h-32 w-32 md:mb-6 md:h-48 md:w-48">

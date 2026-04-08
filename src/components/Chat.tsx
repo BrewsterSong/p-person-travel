@@ -7,6 +7,7 @@ import { usePlaceContext } from "@/context/PlaceContext";
 import { useLocationContext } from "@/context/LocationContext";
 import PlaceList from "./PlaceList";
 import PlaceDetail from "./PlaceDetail";
+import DiscussionCardList from "./DiscussionCardList";
 import { Place } from "@/types/chat";
 import { distanceLabel } from "@/lib/distance";
 
@@ -16,16 +17,84 @@ interface ChatProps {
   onMapPlacesChange?: (places: Place[]) => void;
 }
 
+const PENDING_AUTH_MESSAGE_KEY = "pending_auth_message";
+
+function normalizeAvatarUrl(...candidates: Array<unknown>): string | null {
+  for (const candidate of candidates) {
+    if (typeof candidate !== "string") continue;
+    const trimmed = candidate.trim();
+    if (!trimmed || trimmed === "null" || trimmed === "undefined") continue;
+    return trimmed;
+  }
+  return null;
+}
+
 export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange }: ChatProps) {
-  const { messages, isLoading, error, recommendedPlaces, allPlaces, sendMessage, nextPageToken, loadMorePlaces, loadMoreRecommendations } = useChatContext();
-  const { isConfigured, isLoading: isAuthLoading, user, signInWithGoogle, signOut } = useAuthContext();
+  const { messages, isLoading, isHydratingHistory, error, recommendedPlaces, allPlaces, sendMessage, clearMessages, hasMoreHistory, loadOlderMessages, nextPageToken, loadMorePlaces, loadMoreRecommendations } = useChatContext();
+  const { isConfigured, isLoading: isAuthLoading, user, profile, signInWithGoogle, signOut } = useAuthContext();
   const { selectedPlace, selectPlace, setSelectedPlace } = usePlaceContext();
-  const { location } = useLocationContext();
+  const { location, timezone } = useLocationContext();
   const [input, setInput] = useState("");
   const [hoveredPlace, setHoveredPlace] = useState<Place | null>(null);
   const [expandedReasons, setExpandedReasons] = useState<Record<string, boolean>>({});
   const [authError, setAuthError] = useState<string | null>(null);
+  const [isAuthModalOpen, setIsAuthModalOpen] = useState(false);
+  const [isSigningIn, setIsSigningIn] = useState(false);
+  const [isAvatarReady, setIsAvatarReady] = useState(false);
+  const [isProfileMenuOpen, setIsProfileMenuOpen] = useState(false);
+  const [isLoadingOlderMessages, setIsLoadingOlderMessages] = useState(false);
+  const messagesScrollRef = useRef<HTMLDivElement>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+  const profileMenuRef = useRef<HTMLDivElement>(null);
+  const pendingMessageRef = useRef<string | null>(null);
+  const previousMessageCountRef = useRef(messages.length);
+  const preserveScrollRef = useRef<{ scrollHeight: number; scrollTop: number } | null>(null);
+  const isLoadingOlderMessagesRef = useRef(false);
+  const wasHydratingHistoryRef = useRef(isHydratingHistory);
+  const skipNextAutoScrollRef = useRef(false);
+
+  const persistPendingMessage = (message: string) => {
+    pendingMessageRef.current = message;
+    if (typeof window !== "undefined") {
+      window.sessionStorage.setItem(PENDING_AUTH_MESSAGE_KEY, message);
+    }
+  };
+
+  const clearPendingMessage = () => {
+    pendingMessageRef.current = null;
+    if (typeof window !== "undefined") {
+      window.sessionStorage.removeItem(PENDING_AUTH_MESSAGE_KEY);
+    }
+  };
+
+  const formatTimestamp = (value?: string) => {
+    if (!value) return null;
+    const date = new Date(value);
+    if (Number.isNaN(date.getTime())) return null;
+
+    return new Intl.DateTimeFormat("zh-CN", {
+      timeZone: timezone || location?.timezone || "UTC",
+      month: "numeric",
+      day: "numeric",
+      hour: "2-digit",
+      minute: "2-digit",
+      hour12: false,
+    }).format(date);
+  };
+
+  const shouldShowTimestamp = (
+    current: (typeof messages)[number],
+    previous?: (typeof messages)[number]
+  ) => {
+    if (!current.createdAt) return false;
+    if (!previous?.createdAt) return true;
+
+    const currentDate = new Date(current.createdAt);
+    const previousDate = new Date(previous.createdAt);
+    if (Number.isNaN(currentDate.getTime()) || Number.isNaN(previousDate.getTime())) return false;
+
+    return currentDate.getTime() - previousDate.getTime() >= 15 * 60 * 1000;
+  };
 
   const ReasonText = ({
     text,
@@ -128,9 +197,76 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
     };
   }, [allPlaces, placesMap]);
 
+  useLayoutEffect(() => {
+    const container = messagesScrollRef.current;
+    const preserveScroll = preserveScrollRef.current;
+
+    if (container && preserveScroll) {
+      container.scrollTop = container.scrollHeight - preserveScroll.scrollHeight + preserveScroll.scrollTop;
+      preserveScrollRef.current = null;
+      previousMessageCountRef.current = messages.length;
+    }
+  }, [messages]);
+
   useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
-  }, [messages, recommendedPlaces, selectedPlace]);
+    const finishedHydrating = wasHydratingHistoryRef.current && !isHydratingHistory;
+    wasHydratingHistoryRef.current = isHydratingHistory;
+
+    if (!finishedHydrating) return;
+
+    // Restoring history on first load should keep the user's natural position
+    // instead of being treated like a new incoming message.
+    previousMessageCountRef.current = messages.length;
+    skipNextAutoScrollRef.current = true;
+  }, [isHydratingHistory, messages.length]);
+
+  useEffect(() => {
+    if (preserveScrollRef.current) return;
+
+    if (skipNextAutoScrollRef.current) {
+      skipNextAutoScrollRef.current = false;
+      previousMessageCountRef.current = messages.length;
+      return;
+    }
+
+    const previousCount = previousMessageCountRef.current;
+    const messageWasAppended = messages.length > previousCount;
+    previousMessageCountRef.current = messages.length;
+
+    if (messageWasAppended || isLoading) {
+      messagesEndRef.current?.scrollIntoView({ behavior: "smooth" });
+    }
+  }, [isLoading, messages]);
+
+  const handleLoadOlderMessages = async () => {
+    if (!user || !hasMoreHistory || isHydratingHistory || isLoadingOlderMessagesRef.current) return;
+
+    const container = messagesScrollRef.current;
+    if (container) {
+      preserveScrollRef.current = {
+        scrollHeight: container.scrollHeight,
+        scrollTop: container.scrollTop,
+      };
+    }
+
+    isLoadingOlderMessagesRef.current = true;
+    setIsLoadingOlderMessages(true);
+
+    try {
+      await loadOlderMessages();
+    } finally {
+      isLoadingOlderMessagesRef.current = false;
+      setIsLoadingOlderMessages(false);
+    }
+  };
+
+  const handleMessagesScroll = () => {
+    const container = messagesScrollRef.current;
+    if (!container) return;
+    if (container.scrollTop > 96) return;
+
+    void handleLoadOlderMessages();
+  };
 
   // Notify parent when selectedPlace changes
   useEffect(() => {
@@ -150,9 +286,56 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
     onMapPlacesChange?.(recommendedPlaces);
   }, [onMapPlacesChange, recommendedPlaces]);
 
+  useEffect(() => {
+    if (typeof window === "undefined") return;
+    const pending = window.sessionStorage.getItem(PENDING_AUTH_MESSAGE_KEY);
+    if (pending) {
+      pendingMessageRef.current = pending;
+      setInput((current) => current || pending);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!isProfileMenuOpen) return;
+
+    const handlePointerDown = (event: PointerEvent) => {
+      const target = event.target as Node | null;
+      if (profileMenuRef.current && target && !profileMenuRef.current.contains(target)) {
+        setIsProfileMenuOpen(false);
+      }
+    };
+
+    window.addEventListener("pointerdown", handlePointerDown);
+    return () => window.removeEventListener("pointerdown", handlePointerDown);
+  }, [isProfileMenuOpen]);
+
+  useEffect(() => {
+    if (!user || isLoading || isHydratingHistory || isAuthLoading) return;
+
+    const pending = pendingMessageRef.current;
+    if (!pending?.trim()) return;
+
+    clearPendingMessage();
+    setInput("");
+    void sendMessage(pending.trim());
+  }, [isAuthLoading, isHydratingHistory, isLoading, sendMessage, user]);
+
+  useEffect(() => {
+    if (!user) return;
+    setIsSigningIn(false);
+    setIsAuthModalOpen(false);
+  }, [user]);
+
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     if (!input.trim() || isLoading) return;
+
+    if (!user) {
+      setAuthError(null);
+      persistPendingMessage(input.trim());
+      setIsAuthModalOpen(true);
+      return;
+    }
 
     const userInput = input.trim();
     setInput("");
@@ -161,9 +344,7 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
   };
 
   const handlePlaceClick = async (place: Place) => {
-    console.log("[Chat] handlePlaceClick called:", place.name);
     await selectPlace(place);
-    console.log("[Chat] After selectPlace, selectedPlace:", selectedPlace?.name);
   };
 
   const handleCloseDetail = () => {
@@ -171,22 +352,61 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
   };
 
   const displayName =
+    profile?.name ||
     user?.user_metadata?.full_name ||
     user?.user_metadata?.name ||
     user?.email ||
     "Traveler";
-  const avatarUrl =
-    user?.user_metadata?.avatar_url ||
-    user?.user_metadata?.picture ||
-    null;
+  const avatarUrl = normalizeAvatarUrl(
+    profile?.avatar_url,
+    user?.user_metadata?.avatar_url,
+    user?.user_metadata?.picture,
+    ...(Array.isArray(user?.identities)
+      ? user.identities.flatMap((identity) => {
+          const identityData =
+            identity && typeof identity === "object" && "identity_data" in identity
+              ? identity.identity_data
+              : null;
+          if (!identityData || typeof identityData !== "object") return [];
+
+          return [
+            "avatar_url" in identityData ? identityData.avatar_url : null,
+            "picture" in identityData ? identityData.picture : null,
+          ];
+        })
+      : [])
+  );
+
+  useEffect(() => {
+    if (!avatarUrl) {
+      setIsAvatarReady(false);
+      return;
+    }
+
+    let cancelled = false;
+    const img = new window.Image();
+    img.onload = () => {
+      if (!cancelled) setIsAvatarReady(true);
+    };
+    img.onerror = () => {
+      if (!cancelled) setIsAvatarReady(false);
+    };
+    img.src = avatarUrl;
+
+    return () => {
+      cancelled = true;
+    };
+  }, [avatarUrl]);
 
   const handleGoogleSignIn = async () => {
     setAuthError(null);
+    setIsSigningIn(true);
     try {
       await signInWithGoogle();
     } catch (signInError) {
       console.error("[auth] Google sign-in failed:", signInError);
       setAuthError("Google 登录失败，请稍后再试。");
+      setIsSigningIn(false);
     }
   };
 
@@ -194,6 +414,12 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
     setAuthError(null);
     try {
       await signOut();
+      clearPendingMessage();
+      clearMessages();
+      setSelectedPlace(null);
+      setInput("");
+      setIsProfileMenuOpen(false);
+      setIsSigningIn(false);
     } catch (signOutError) {
       console.error("[auth] Sign-out failed:", signOutError);
       setAuthError("退出登录失败，请稍后再试。");
@@ -210,24 +436,27 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
   }
 
   return (
-    <div className="min-h-0 flex-1 bg-white flex flex-col md:h-full">
+    <div className="relative min-h-0 flex-1 bg-white flex flex-col md:h-full">
       {/* Header */}
       <div className="shrink-0 border-b border-gray-200 px-3 py-2 md:px-4 md:py-3">
         <div className="flex items-center justify-between gap-3">
           <div>
             <h1 className="text-lg font-semibold md:text-xl">P-Person Travel Assistant</h1>
-            <p className="text-xs text-gray-500">随时随地找到下一站去哪里</p>
+            <p className="text-xs text-gray-500">随时随地找到附近好吃、好喝、好玩、好逛的地方</p>
           </div>
 
           {isConfigured ? (
             user ? (
-              <div className="flex items-center gap-2">
-                <div className="hidden text-right md:block">
-                  <p className="text-sm font-medium text-gray-900">{String(displayName)}</p>
-                  <p className="text-xs text-gray-500">已连接 Google</p>
-                </div>
-                <div className="flex h-9 w-9 items-center justify-center overflow-hidden rounded-full bg-gray-100 text-sm font-semibold text-gray-700">
-                  {avatarUrl ? (
+              <div ref={profileMenuRef} className="relative flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setIsProfileMenuOpen((prev) => !prev)}
+                  className="flex h-9 w-9 cursor-pointer items-center justify-center overflow-hidden rounded-full border border-gray-200 bg-white text-sm font-semibold text-gray-700 shadow-sm transition hover:border-gray-300 hover:bg-gray-50"
+                  aria-haspopup="menu"
+                  aria-expanded={isProfileMenuOpen}
+                  title={String(displayName)}
+                >
+                  {avatarUrl && isAvatarReady ? (
                     <div
                       aria-label={String(displayName)}
                       className="h-full w-full bg-cover bg-center"
@@ -237,23 +466,35 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
                   ) : (
                     String(displayName).slice(0, 1).toUpperCase()
                   )}
-                </div>
-                <button
-                  type="button"
-                  onClick={handleSignOut}
-                  className="rounded-full border border-gray-200 px-3 py-2 text-xs font-medium text-gray-700 transition hover:bg-gray-50"
-                >
-                  退出
                 </button>
+                {isProfileMenuOpen && (
+                  <div className="absolute right-0 top-12 z-30 min-w-40 overflow-hidden rounded-2xl border border-gray-200 bg-white py-2 shadow-xl">
+                    <div className="border-b border-gray-100 px-4 pb-2">
+                      <p className="truncate text-sm font-medium text-gray-900">{String(displayName)}</p>
+                      <p className="truncate text-xs text-gray-500">{user.email}</p>
+                    </div>
+                    <button
+                      type="button"
+                      onClick={handleSignOut}
+                      className="mt-1 w-full cursor-pointer px-4 py-2 text-left text-sm text-gray-700 transition hover:bg-gray-50"
+                    >
+                      退出登录
+                    </button>
+                  </div>
+                )}
               </div>
             ) : (
               <button
                 type="button"
-                onClick={handleGoogleSignIn}
+                onClick={() => {
+                  setAuthError(null);
+                  setIsSigningIn(false);
+                  setIsAuthModalOpen(true);
+                }}
                 disabled={isAuthLoading}
-                className="rounded-full bg-gray-900 px-4 py-2 text-sm font-medium text-white transition hover:bg-gray-800 disabled:cursor-not-allowed disabled:opacity-60"
+                className="inline-flex cursor-pointer items-center gap-2 rounded-full border border-gray-200 bg-white px-3 py-1.5 text-sm font-medium text-gray-800 shadow-sm transition-all duration-150 hover:border-gray-300 hover:bg-gray-50 hover:shadow md:px-3.5 md:py-2 disabled:cursor-not-allowed disabled:opacity-60"
               >
-                {isAuthLoading ? "加载中..." : "Continue with Google"}
+                <span>{isAuthLoading ? "加载中..." : "登录"}</span>
               </button>
             )
           ) : (
@@ -269,12 +510,36 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
 
       {/* Chat Area */}
       <div
+        ref={messagesScrollRef}
+        onScroll={handleMessagesScroll}
         className="flex-1 overflow-y-auto overscroll-y-contain p-3 md:p-4"
         style={{ scrollbarGutter: "stable", WebkitOverflowScrolling: "touch" }}
       >
-        {messages.map((message) => (
+        {user && isLoadingOlderMessages && (
+          <div className="pointer-events-none sticky top-2 z-20 -mt-2 flex h-0 justify-center overflow-visible">
+            <div className="flex h-8 w-8 items-center justify-center rounded-full bg-white/85 shadow-[0_2px_10px_rgba(15,23,42,0.12)] backdrop-blur-sm">
+              <span className="h-4 w-4 animate-spin rounded-full border-2 border-gray-200 border-t-gray-700" />
+              <span className="sr-only">正在加载更早消息</span>
+            </div>
+          </div>
+        )}
+
+        {isHydratingHistory && (
+          <div className="mb-4 flex justify-center">
+            <div className="rounded-full bg-gray-100 px-4 py-2 text-sm text-gray-500">
+              正在恢复最近对话...
+            </div>
+          </div>
+        )}
+
+        {messages.map((message, index) => (
           (() => {
+            const previousMessage = messages[index - 1];
             const hasRecs = message.role === "assistant" && message.recommendations && message.recommendations.length > 0;
+            const hasDiscussions = message.role === "assistant" && message.discussions && message.discussions.length > 0;
+            const disableLoadMore =
+              message.meta?.disableLoadMore === true ||
+              (hasRecs && /(?:正在营业|营业中|没打烊|没有打烊|未打烊|open now)/i.test(message.content || ""));
             const suggestionPool = ["更近一点", "预算更低", "更安静", "想坐露台", "换一批"];
             const hash = (s: string) => {
               let h = 0;
@@ -288,19 +553,44 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
               const out: string[] = [];
               for (let i = 0; i < suggestionPool.length && out.length < count; i++) {
                 const v = suggestionPool[(start + i) % suggestionPool.length];
-                if (!out.includes(v)) out.push(v);
+                if (!disableLoadMore && !out.includes(v)) out.push(v);
+                if (disableLoadMore && v !== "换一批" && !out.includes(v)) out.push(v);
               }
               return out;
             };
             const suggestions = hasRecs ? pickSuggestions(message.id) : [];
             const batchPlaces = hasRecs ? resolvePlacesForRecommendations(message.recommendations) : [];
+            const systemKind = typeof message.meta?.systemKind === "string" ? message.meta.systemKind : null;
             return (
+          <div key={message.id}>
+          {shouldShowTimestamp(message, previousMessage) && (
+            <div className="mb-4 flex justify-center">
+              <span className="rounded-full bg-gray-100 px-3 py-1 text-[11px] text-gray-500">
+                {formatTimestamp(message.createdAt)}
+              </span>
+            </div>
+          )}
+          {message.role === "system" ? (
+            systemKind === "location-switched" ? (
+              <div key={message.id} className="mb-4 flex items-center gap-3 px-2 text-[12px] text-gray-400">
+                <div className="h-px flex-1 bg-gray-200" />
+                <span className="whitespace-nowrap">{message.content}</span>
+                <div className="h-px flex-1 bg-gray-200" />
+              </div>
+            ) : (
+              <div key={message.id} className="mb-4 flex justify-center">
+                <div className="rounded-2xl border border-amber-200 bg-amber-50 px-4 py-2 text-sm text-amber-800">
+                  {message.content}
+                </div>
+              </div>
+            )
+          ) : (
           <div
             key={message.id}
             className={`flex ${message.role === "user" ? "justify-end" : "justify-start"} mb-4`}
           >
             <div
-              className={`${hasRecs ? "w-full max-w-full" : "max-w-[92%] md:max-w-[80%]"} rounded-lg p-3 ${
+              className={`${hasRecs || hasDiscussions ? "w-full max-w-full" : "max-w-[92%] md:max-w-[80%]"} rounded-lg p-3 ${
                 message.role === "user"
                   ? "bg-blue-500 text-white"
                   : "bg-gray-100 text-gray-800"
@@ -434,7 +724,7 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
                       })}
 
                     {/* 换一批按钮 - 从已有地点中选择不同的推荐 */}
-                    {allPlaces.length > 0 && allPlaces.length > recommendedPlaces.length && (
+                    {!disableLoadMore && allPlaces.length > 0 && allPlaces.length > recommendedPlaces.length && (
                       <button
                         onClick={() => {
                           // 获取已推荐的地点 ID
@@ -457,7 +747,13 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
                   </div>
                 </div>
               )}
+
+              {message.role === "assistant" && message.discussions && message.discussions.length > 0 && (
+                <DiscussionCardList discussions={message.discussions} />
+              )}
             </div>
+            </div>
+          )}
           </div>
             );
           })()
@@ -501,7 +797,7 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
-          placeholder="输入你的位置或需求..."
+          placeholder={user ? "输入你的位置或需求..." : "登录后开始对话"}
           className="h-10 flex-1 min-w-0 rounded-full border border-gray-300 px-4 text-sm focus:outline-none focus:border-blue-500 md:text-base"
           disabled={isLoading}
         />
@@ -513,6 +809,53 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
           发送
         </button>
       </form>
+
+      {isAuthModalOpen && (
+        <div className="absolute inset-0 z-40 flex items-center justify-center bg-black/35 px-4">
+          <div className="w-full max-w-sm rounded-3xl bg-white p-5 shadow-2xl">
+            <div className="flex items-start justify-between gap-4">
+              <div>
+                <h2 className="text-lg font-semibold text-gray-900">登录</h2>
+                <p className="mt-1 text-sm text-gray-500">登录后才能开始对话和保存你的旅行进度。</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  setIsSigningIn(false);
+                  setIsAuthModalOpen(false);
+                }}
+                disabled={isSigningIn}
+                className="flex h-8 w-8 cursor-pointer items-center justify-center rounded-full text-gray-400 transition hover:bg-gray-100 hover:text-gray-600 disabled:cursor-not-allowed disabled:opacity-40"
+                aria-label="关闭登录弹窗"
+              >
+                ×
+              </button>
+            </div>
+
+            <div className="mt-5 space-y-2">
+              <button
+                type="button"
+                onClick={handleGoogleSignIn}
+                disabled={isAuthLoading || isSigningIn}
+                className="flex w-full cursor-pointer items-center justify-between rounded-2xl border border-gray-200 bg-white px-4 py-3 text-left text-sm font-medium text-gray-900 transition hover:border-gray-300 hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-60"
+              >
+                <span className="flex items-center gap-3">
+                  <span className="flex h-9 w-9 items-center justify-center rounded-full bg-gray-100 text-sm font-semibold text-gray-700">
+                    {isSigningIn ? "…" : "G"}
+                  </span>
+                  <span>{isSigningIn ? "正在跳转到 Google..." : "使用 Google 登录"}</span>
+                </span>
+                <span className="text-gray-400">{isSigningIn ? "" : "›"}</span>
+              </button>
+              {isSigningIn && (
+                <p className="px-1 text-xs text-gray-500">
+                  浏览器正在打开 Google 授权页，请稍等一下。
+                </p>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   );
 }

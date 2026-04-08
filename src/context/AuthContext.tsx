@@ -12,41 +12,39 @@ import {
   createSupabaseBrowserClient,
   isSupabaseConfigured,
 } from "@/lib/supabase/client";
+import {
+  claimActiveDevice,
+  getAuthState,
+  getOrCreateDeviceId,
+  getProfile,
+  syncProfileBase,
+  type PersistedProfile,
+} from "@/lib/supabase/appData";
 
 type AuthContextType = {
   isConfigured: boolean;
   isLoading: boolean;
   session: Session | null;
   user: User | null;
+  profile: PersistedProfile | null;
+  client: SupabaseClient | null;
   signInWithGoogle: () => Promise<void>;
   signOut: () => Promise<void>;
 };
 
 const AuthContext = createContext<AuthContextType | null>(null);
 
-async function syncProfile(client: SupabaseClient, user: User) {
-  const metadata = user.user_metadata ?? {};
+async function bootstrapProfile(client: SupabaseClient, user: User) {
+  const {
+    data: { user: freshUser },
+  } = await client.auth.getUser();
+  const userToSync = freshUser ?? user;
 
-  const { error } = await client.from("profiles").upsert(
-    {
-      id: user.id,
-      email: user.email ?? null,
-      name:
-        (typeof metadata.full_name === "string" && metadata.full_name) ||
-        (typeof metadata.name === "string" && metadata.name) ||
-        null,
-      avatar_url:
-        (typeof metadata.avatar_url === "string" && metadata.avatar_url) ||
-        (typeof metadata.picture === "string" && metadata.picture) ||
-        null,
-      updated_at: new Date().toISOString(),
-    },
-    { onConflict: "id" }
-  );
-
-  if (error) {
-    console.warn("[auth] Failed to sync profile:", error.message);
-  }
+  const profile = await syncProfileBase(client, userToSync);
+  const deviceId = getOrCreateDeviceId();
+  await claimActiveDevice(client, userToSync.id, deviceId);
+  const freshProfile = await getProfile(client, userToSync.id);
+  return freshProfile ?? profile;
 }
 
 export function AuthProvider({ children }: { children: ReactNode }) {
@@ -58,6 +56,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
   const [isLoading, setIsLoading] = useState(() => configured);
   const [session, setSession] = useState<Session | null>(null);
   const [user, setUser] = useState<User | null>(null);
+  const [profile, setProfile] = useState<PersistedProfile | null>(null);
 
   useEffect(() => {
     if (!configured || !client) {
@@ -78,7 +77,13 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setUser(initialSession?.user ?? null);
 
       if (initialSession?.user) {
-        void syncProfile(supabase, initialSession.user);
+        try {
+          const nextProfile = await bootstrapProfile(supabase, initialSession.user);
+          if (!isMounted) return;
+          setProfile(nextProfile);
+        } catch (error) {
+          console.warn("[auth] Failed to bootstrap profile:", error);
+        }
       }
 
       setIsLoading(false);
@@ -94,7 +99,16 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       setIsLoading(false);
 
       if (nextSession?.user) {
-        void syncProfile(supabase, nextSession.user);
+        void (async () => {
+          try {
+            const nextProfile = await bootstrapProfile(supabase, nextSession.user);
+            setProfile(nextProfile);
+          } catch (error) {
+            console.warn("[auth] Failed to sync profile after auth change:", error);
+          }
+        })();
+      } else {
+        setProfile(null);
       }
     });
 
@@ -103,6 +117,35 @@ export function AuthProvider({ children }: { children: ReactNode }) {
       subscription.unsubscribe();
     };
   }, [client, configured]);
+
+  useEffect(() => {
+    if (!client || !user) return;
+
+    let cancelled = false;
+    const deviceId = getOrCreateDeviceId();
+
+    const verifyCurrentDevice = async () => {
+      try {
+        const authState = await getAuthState(client, user.id);
+        if (!cancelled && authState?.active_device_id && authState.active_device_id !== deviceId) {
+          await client.auth.signOut();
+        }
+      } catch (error) {
+        console.warn("[auth] Failed to verify active device:", error);
+      }
+    };
+
+    void verifyCurrentDevice();
+    const onFocus = () => {
+      void verifyCurrentDevice();
+    };
+
+    window.addEventListener("focus", onFocus);
+    return () => {
+      cancelled = true;
+      window.removeEventListener("focus", onFocus);
+    };
+  }, [client, user]);
 
   const signInWithGoogle = async () => {
     if (!client) return;
@@ -114,7 +157,12 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const { error } = await client.auth.signInWithOAuth({
       provider: "google",
-      options: { redirectTo },
+      options: {
+        redirectTo,
+        queryParams: {
+          prompt: "select_account",
+        },
+      },
     });
 
     if (error) {
@@ -137,6 +185,8 @@ export function AuthProvider({ children }: { children: ReactNode }) {
         isLoading,
         session,
         user,
+        profile,
+        client,
         signInWithGoogle,
         signOut,
       }}

@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { getGoogleMapsServerApiKey, normalizePlaceSummary } from "@/lib/googlePlaces";
+import { searchRedditDiscussions } from "@/lib/reddit";
 import { getServerCacheString, setServerCacheString } from "@/lib/serverCache";
 
 const API_KEY = process.env.SILICONFLOW_API_KEY;
@@ -201,10 +202,27 @@ function isLoadMoreMessage(userMessage: string): boolean {
   return LOAD_MORE_PATTERNS.some((re) => re.test(userMessage));
 }
 
+function isOpenNowConstraintMessage(userMessage: string): boolean {
+  const msg = userMessage.trim();
+  if (!msg) return false;
+
+  const patterns: RegExp[] = [
+    /只看.*(?:营业|开门|开着)/,
+    /(?:正在营业|营业中|还开|开着|开门|没打烊|没有打烊|未打烊|不打烊)/,
+    /(?:不要|别|排除|不想要|不看).*打烊/,
+    /(?:没有|没|未|不).*打烊/,
+    /(?:现在|当前|此时|这会儿|马上).*(?:营业|开门|开着|能去)/,
+    /(?:夜宵|宵夜)/,
+    /open\s*now/i,
+  ];
+  return patterns.some((re) => re.test(msg));
+}
+
 function isAppendConstraintMessage(userMessage: string): boolean {
   const msg = userMessage.trim();
   if (!msg) return false;
   if (isLoadMoreMessage(msg)) return false;
+  if (isOpenNowConstraintMessage(msg)) return true;
 
   // Common "follow-up constraints" patterns.
   const patterns: RegExp[] = [
@@ -243,7 +261,7 @@ function isPlaceSearchRequest(message: string): boolean {
   // Broad: any query that likely expects cards on map.
   const keywords = [
     // Food & drink
-    "吃", "餐厅", "饭店", "美食", "日料", "日本料理", "韩餐", "西餐", "早餐", "午餐", "晚餐", "咖啡", "cafe", "restaurant", "food",
+    "吃", "餐厅", "饭店", "美食", "日料", "日本料理", "韩餐", "西餐", "早餐", "午餐", "晚餐", "夜宵", "宵夜", "烤肉", "烧肉", "烧烤", "bbq", "barbecue", "咖啡", "cafe", "restaurant", "food",
     "酒吧", "bar", "cocktail", "鸡尾酒",
     // Shopping
     "商场", "购物", "逛街", "mall", "shopping",
@@ -264,6 +282,52 @@ function isPlaceSearchRequest(message: string): boolean {
   return keywords.some((k) => m.includes(k.toLowerCase()));
 }
 
+function isTravelDiscussionRequest(message: string): boolean {
+  const m = (message || "").trim().toLowerCase();
+  if (!m) return false;
+
+  const patterns = [
+    /reddit/,
+    /\bitinerary\b/,
+    /\broad trip\b/,
+    /\btrip report\b/,
+    /\bwhere to stay\b/,
+    /\bthings to know\b/,
+    /\btravel tips\b/,
+    /行程/,
+    /攻略/,
+    /住哪/,
+    /住哪里/,
+    /住宿建议/,
+    /避坑/,
+    /交通经验/,
+    /路线优化/,
+    /自驾/,
+  ];
+
+  return patterns.some((pattern) => pattern.test(m));
+}
+
+function isTravelDiscussionSeedQuery(message: string): boolean {
+  const trimmed = (message || "").trim();
+  if (!trimmed) return false;
+  if (isPlaceSearchRequest(trimmed)) return false;
+  if (trimmed.length > 40) return false;
+
+  const tokens = trimmed.split(/\s+/).filter(Boolean);
+  if (tokens.length > 4) return false;
+
+  return /[A-Za-z\u4e00-\u9fff]/.test(trimmed);
+}
+
+function buildRedditSearchQuery(message: string): string {
+  return (message || "")
+    .replace(/^(帮我|给我|请)?(搜|找|看看|查一下)?\s*/g, "")
+    .replace(/reddit\s*(上|里的)?/gi, "")
+    .replace(/关于/g, "")
+    .trim();
+}
+
 function inferIncludedTypesForClientSearch(message: string): string[] {
   const m = (message || "").toLowerCase();
   if (!m) return [];
@@ -276,7 +340,9 @@ function inferIncludedTypesForClientSearch(message: string): string[] {
   if (/(景点|打卡|观光|tourist|attraction|博物馆|museum|公园|park)/i.test(m)) return ["tourist_attraction"];
   if (/(酒吧|bar|鸡尾酒|cocktail)/i.test(m)) return ["bar"];
   if (/(咖啡|cafe)/i.test(m)) return ["cafe"];
-  if (/(餐厅|吃|美食|restaurant)/i.test(m)) return ["restaurant"];
+  if (/(烤肉|烧肉)/i.test(m)) return ["korean_restaurant", "barbecue_restaurant"];
+  if (/(烧烤|bbq|barbecue)/i.test(m)) return ["barbecue_restaurant"];
+  if (/(餐厅|吃|美食|夜宵|宵夜|restaurant)/i.test(m)) return ["restaurant"];
   return [];
 }
 
@@ -291,13 +357,13 @@ function inferRadiusForClientSearch(message: string): number {
 
 type QueryConversionResult =
   | { action: "load_more" }
-  | { needClientSearch: true; searchParams: { textQuery: string } }
+  | { needClientSearch: true; searchParams: { textQuery: string; openNowOnly?: boolean } }
   | { needClientSearch: false };
 
 function isRestaurantLikeMessage(message: string): boolean {
   const restaurantKeywords = [
     "吃", "餐厅", "饭店", "美食", "日料", "泰国菜", "日本料理", "韩餐",
-    "西餐", "早餐", "午餐", "晚餐", "推荐", "附近", "便宜", "好吃",
+    "西餐", "早餐", "午餐", "晚餐", "夜宵", "宵夜", "烤肉", "烧肉", "烧烤", "bbq", "barbecue", "推荐", "附近", "便宜", "好吃",
     "咖啡", "cafe", "restaurant", "food",
   ];
   return restaurantKeywords.some((k) => message.toLowerCase().includes(k.toLowerCase()));
@@ -331,7 +397,7 @@ async function runQueryConversionEngine(params: {
 禁止任何问候、解释或建议。禁止输出任何 Markdown 格式。
 根据对话历史和最新输入，判断用户的意图：
 - 如果用户是在要求翻页（如：换一批、还有吗）：必须返回 {"action": "load_more"}
-- 如果用户是追加了新条件（仅限：远/近、预算/价格、安静/氛围、户外/露台等可由关键词表达的约束）：必须从历史中提取地点和类别，合并新条件生成新的搜索词，并返回 {"needClientSearch": true, "searchParams": {"textQuery": "合并后的新搜索词"}}
+- 如果用户是追加了新条件（仅限：远/近、预算/价格、安静/氛围、户外/露台、正在营业/open now 等可由关键词表达的约束）：必须从历史中提取地点和类别，合并新条件生成新的搜索词，并返回 {"needClientSearch": true, "searchParams": {"textQuery": "合并后的新搜索词"}}
   - 不要生成“排队/人少/实时拥挤”等无法从 Google Places 字段直接获得的约束词。
 你的输出必须是以 '{' 开始，以 '}' 结束的合法 JSON 字符串。
 
@@ -526,7 +592,6 @@ function calculateRelevanceScore(
   if (hasAccommodationType && !isIntentAccommodation) {
     // 一票否决：非住宿意图但地点是住宿类型
     score -= 1000;
-    console.log(`  [VETO] ${place.name}: has hotel/lodging in types, score = ${score}`);
     return score;
   }
 
@@ -535,7 +600,6 @@ function calculateRelevanceScore(
     const lowerIntentType = intentType.toLowerCase();
     if (placePrimaryType.includes(lowerIntentType)) {
       score += 100;
-      console.log(`  [+100] ${place.name}: primaryType "${placePrimaryType}" matches "${lowerIntentType}"`);
       break; // primaryType 只加一次分
     }
   }
@@ -546,13 +610,11 @@ function calculateRelevanceScore(
     for (const placeType of placeTypes) {
       if (placeType.includes(lowerIntentType)) {
         score += 20;
-        console.log(`  [+20] ${place.name}: types contains "${lowerIntentType}"`);
         break; // 每个 intentType 只加一次
       }
     }
   }
 
-  console.log(`  [SCORE] ${place.name}: final score = ${score}`);
   return score;
 }
 
@@ -567,29 +629,16 @@ function reRankByIntent(
   includedTypes: string[],
   intentTypes: string[]
 ): any[] {
-  console.log("=== Intent-Aware Re-ranking ===");
-
   // 计算每个地点的分数
   const scoredPlaces = places.map(place => ({
     ...place,
     _relevanceScore: calculateRelevanceScore(place, includedTypes, intentTypes),
   }));
 
-  // 打印所有地点的分数
-  console.log("All places with scores:");
-  scoredPlaces.forEach((p: any) => {
-    console.log(`  ${p.name}: score=${p._relevanceScore}, primaryType=${p.primaryType}`);
-  });
-
   // 过滤分数 < 0 的地点，并按分数降序排列
   const filteredAndSorted = scoredPlaces
     .filter(p => p._relevanceScore >= 0)
     .sort((a, b) => b._relevanceScore - a._relevanceScore);
-
-  console.log(`After filtering (score >= 0): ${filteredAndSorted.length} places remain`);
-  filteredAndSorted.forEach((p: any, i: number) => {
-    console.log(`  ${i + 1}. ${p.name} (score: ${p._relevanceScore})`);
-  });
 
   return filteredAndSorted;
 }
@@ -745,7 +794,6 @@ async function analyzeUserIntent(userMessage: string): Promise<{
       fallbackTypes = ["korean_restaurant"];
     }
 
-    console.log("⚠️ LLM parse failed, using fallback:", fallbackTypes);
     const out = {
       includedTypes: fallbackTypes,
       targetTypes: fallbackTypes,
@@ -844,11 +892,8 @@ export async function POST(request: NextRequest) {
       );
     }
 
-    console.log("=== Chat with Places API ===");
-
     // Get user's latest message
     const userMessage = messages[messages.length - 1]?.content || "";
-    console.log("User message:", userMessage);
 
     if (isSelfIntroMessage(userMessage)) {
       return NextResponse.json({ content: buildSelfIntro() });
@@ -870,13 +915,29 @@ export async function POST(request: NextRequest) {
     const isLoadMoreRequest = loadMorePatterns.some(pattern => pattern.test(userMessage));
 
     if (isLoadMoreRequest) {
-      console.log("检测到'换一批'意图，返回 action: load_more");
       return NextResponse.json({
         action: "load_more",
         content: JSON.stringify({
           intro: "好的，我来帮你换一批推荐！",
           places: [],
         }),
+      });
+    }
+
+    if (isTravelDiscussionRequest(userMessage) || (!location && isTravelDiscussionSeedQuery(userMessage))) {
+      const discussionQuery = buildRedditSearchQuery(userMessage);
+      const discussions = await searchRedditDiscussions(discussionQuery || userMessage, { limit: 4 });
+
+      if (discussions.length === 0) {
+        return NextResponse.json({
+          content: "我暂时没有搜到合适的 Reddit 旅行讨论，你可以换个更具体的关键词试试，比如 Kyoto itinerary 或 where to stay in Osaka。",
+          discussions: [],
+        });
+      }
+
+      return NextResponse.json({
+        content: `我找了 ${discussions.length} 条 Reddit 上比较相关的旅行讨论，先按“讨论卡”整理给你。`,
+        discussions,
       });
     }
 
@@ -897,13 +958,30 @@ export async function POST(request: NextRequest) {
     const baseFromHistory = inferBaseQueryFromHistory(trimmedHistory);
 
     // Detect if this is a restaurant request
-    const restaurantKeywords = ["吃", "餐厅", "饭店", "美食", "日料", "泰国菜", "日本料理", "韩餐", "西餐", "早餐", "午餐", "晚餐", "推荐", "附近", "便宜", "好吃", "咖啡", "cafe", "restaurant", "food"];
+    const restaurantKeywords = ["吃", "餐厅", "饭店", "美食", "日料", "泰国菜", "日本料理", "韩餐", "西餐", "早餐", "午餐", "晚餐", "夜宵", "宵夜", "烤肉", "烧肉", "烧烤", "bbq", "barbecue", "推荐", "附近", "便宜", "好吃", "咖啡", "cafe", "restaurant", "food"];
     const isRestaurantRequest = restaurantKeywords.some(keyword => userMessage.toLowerCase().includes(keyword.toLowerCase()));
     const isAppendConstraint = isAppendConstraintMessage(userMessage);
+    const openNowOnly = isOpenNowConstraintMessage(userMessage);
 
     // Query conversion engine: only returns strict JSON signals; never forward raw model text.
     // This enables "追加条件" messages without repeating the whole query.
     if (location && isAppendConstraint && baseFromHistory) {
+      if (openNowOnly) {
+        const includedTypesFromBase = inferIncludedTypesForClientSearch(baseFromHistory);
+        return NextResponse.json({
+          needClientSearch: true,
+          userMessage,
+          searchParams: {
+            latitude: location.latitude,
+            longitude: location.longitude,
+            radius: inferRadiusForClientSearch(baseFromHistory),
+            textQuery: baseFromHistory,
+            includedTypes: includedTypesFromBase,
+            openNowOnly: true,
+          },
+        });
+      }
+
       const conversion = await runQueryConversionEngine({
         historyMessages: trimmedHistory,
         userMessage,
@@ -934,6 +1012,7 @@ export async function POST(request: NextRequest) {
             radius: inferRadiusForClientSearch(mergedQuery),
             textQuery: mergedQuery,
             includedTypes: inferredIncludedTypes,
+            openNowOnly,
           },
         });
       }
@@ -949,6 +1028,26 @@ export async function POST(request: NextRequest) {
           radius: inferRadiusForClientSearch(textQuery),
           textQuery,
           includedTypes: inferIncludedTypesForClientSearch(textQuery),
+          openNowOnly,
+        },
+      });
+    }
+
+    // Hard guard: "只看没打烊/营业中" must never fall through to free-form LLM text.
+    // If recent history extraction failed, use a broad nearby search and let the client
+    // apply openNow plus type filters with the last local search context when available.
+    if (location && openNowOnly) {
+      const textQuery = baseFromHistory || "restaurant";
+      return NextResponse.json({
+        needClientSearch: true,
+        userMessage,
+        searchParams: {
+          latitude: location.latitude,
+          longitude: location.longitude,
+          radius: inferRadiusForClientSearch(textQuery),
+          textQuery,
+          includedTypes: inferIncludedTypesForClientSearch(textQuery),
+          openNowOnly: true,
         },
       });
     }
@@ -964,14 +1063,13 @@ export async function POST(request: NextRequest) {
           radius: inferRadiusForClientSearch(userMessage),
           textQuery: userMessage,
           includedTypes: inferIncludedTypesForClientSearch(userMessage),
+          openNowOnly,
         },
       });
     }
 
     // If not a restaurant request, just do normal chat
     if (!isRestaurantRequest || !location) {
-      console.log("Not a restaurant request or no location, doing normal chat");
-
       // If the caller explicitly asked for JSON-only output, keep the prompt intact even when location is null.
       // This is used by the "换一批/还有吗" flow where we re-rank from an existing list client-side.
       if (wantsJsonOutput(messages)) {
@@ -1018,7 +1116,6 @@ export async function POST(request: NextRequest) {
           },
         });
         const parsed = extractFirstJsonObject(content);
-        console.log("[api/chat] JSON task model =", JSON_TASK_MODEL, "parsedJson =", !!parsed);
         if (!parsed) {
           console.warn("[api/chat] JSON task raw (head):", String(content).slice(0, 240));
         }
@@ -1062,12 +1159,8 @@ export async function POST(request: NextRequest) {
     }
 
     // This is a restaurant request - search places first
-    console.log("Searching places at:", location.latitude, location.longitude);
-
     // Step 1: 动态意图分析，获取精准的 includedTypes
-    console.log("Step 1: Analyzing user intent...");
     const intentAnalysis = await analyzeUserIntent(userMessage);
-    console.log("Intent analysis result:", intentAnalysis);
 
     // 构建 textQuery 用于 Text Search API
     // 使用用户消息作为查询词，并结合位置信息
@@ -1085,32 +1178,14 @@ export async function POST(request: NextRequest) {
       places = result.places;
       nextPageToken = result.nextPageToken;
 
-      // 🔴 调试日志：显示 Google API 实际返回的数据
-      console.log("========== DEBUG: Google API Response ==========");
-      console.log("User message:", userMessage);
-      console.log("textQuery used:", textQuery);
-      console.log("Total places returned:", places.length);
-      if (places.length > 0) {
-        console.log("First 3 places (name, primaryType, types):");
-        places.slice(0, 3).forEach((p: any, i: number) => {
-          console.log(`  ${i + 1}. ${p.name}`);
-          console.log(`     primaryType: ${p.primaryType}`);
-          console.log(`     types: ${JSON.stringify(p.types)}`);
-        });
-      }
-      console.log("================================================");
-
       // Step 2: 意图感知重排 (Intent-Aware Re-ranking)
       // 先使用旧的 filter 函数进行基础过滤，然后再用新重排算法
-      console.log("Step 2: Applying intent-aware re-ranking...");
       if (!intentAnalysis.isHotelAfternoonTea) {
         places = filterPlacesByPrimaryType(places, intentAnalysis.targetTypes, intentAnalysis.isHotelAfternoonTea);
       }
-      console.log("After basic filter:", places.length, "places");
 
       // Step 3: 动态重排算法
       places = reRankByIntent(places, intentAnalysis.includedTypes, intentAnalysis.targetTypes);
-      console.log("After re-ranking:", places.length, "places remain");
     } catch (error: any) {
       console.error("Search error:", error.message);
       // Return instruction for client-side search
@@ -1201,8 +1276,6 @@ ${placesContext}
     const llmData = await llmResponse.json();
     let llmContent = llmData.choices?.[0]?.message?.content || "";
 
-    console.log("LLM raw response:", llmContent);
-
     // Parse the JSON response from LLM
     let recommendations: { id: string; reason: string }[] = [];
     let introText = `帮你精选了这${maxRecommendations}家店：`;
@@ -1218,7 +1291,6 @@ ${placesContext}
       const parsed = JSON.parse(cleanJson);
       introText = parsed.intro || introText;
       recommendations = parsed.places || [];
-      console.log("Parsed recommendations:", recommendations);
     } catch (parseError) {
       console.error("JSON parse error:", parseError);
       // 如果解析失败，返回原始内容作为普通回复

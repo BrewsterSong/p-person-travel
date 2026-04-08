@@ -1,9 +1,26 @@
 "use client";
 
-import { useState, useCallback, useRef } from "react";
-import { ChatMessage, Place, PlaceRecommendation } from "@/types/chat";
+import { useState, useCallback, useRef, useEffect } from "react";
+import { ChatMessage, DiscussionCard, Place, PlaceRecommendation } from "@/types/chat";
+import type { Location } from "@/hooks/useLocation";
 import { useLocationContext } from "@/context/LocationContext";
+import { useAuthContext } from "@/context/AuthContext";
 import { haversineMeters } from "@/lib/distance";
+import {
+  appendChatMessages,
+  createChatSession,
+  deserializeChatMessage,
+  fetchChatMessagesPage,
+  getChatSession,
+  getLatestChatSession,
+  getPreviousChatSession,
+  getProfile,
+  INITIAL_MESSAGE_PAGE_SIZE,
+  OLDER_MESSAGE_PAGE_SIZE,
+  serializeChatMessage,
+  shouldRotateSession,
+  type PersistedChatSession,
+} from "@/lib/supabase/appData";
 
 // 防范坑点1：移除 Markdown 代码块标记的安全解析函数
 // 修复：先用正则提取大括号内容再解析，解决"开头有废话"导致的 JSON.parse 报错
@@ -22,7 +39,6 @@ function extractAndParseJSON(content: string): { intro: string; recommendations:
     const jsonMatch = cleaned.match(/\{[\s\S]*\}/);
     if (!jsonMatch) {
       // 没有找到 JSON，直接返回原始文本
-      console.warn("No JSON found in response, returning original text");
       return {
         intro: content,
         recommendations: [],
@@ -45,7 +61,6 @@ function extractAndParseJSON(content: string): { intro: string; recommendations:
     };
   } catch (error) {
     // 解析失败时，优雅降级：将原始文本作为对话内容返回
-    console.warn("JSON parse failed, returning original text:", content.substring(0, 100));
     return {
       intro: content,
       recommendations: [],
@@ -82,14 +97,12 @@ function filterPlacesByIntent(places: Place[], includedTypes: string[]): Place[]
 
     // 一票否决：如果 primaryType 或 types 包含 hotel/lodging，则排除
     if (primaryType.includes("hotel") || primaryType.includes("lodging")) {
-      console.log(`[Frontend Filter] 过滤掉: ${place.name} (primaryType: ${place.primaryType})`);
       return false;
     }
 
     return true;
   });
 
-  console.log(`[Frontend Filter] 过滤前: ${places.length}, 过滤后: ${filtered.length}`);
   return filtered;
 }
 
@@ -105,7 +118,9 @@ function inferIncludedTypesFromUserMessage(message: string): string[] {
   if (/(景点|打卡|观光|tourist|attraction|博物馆|museum|公园|park)/i.test(m)) return ["tourist_attraction"];
   if (/(酒吧|bar|鸡尾酒|cocktail)/i.test(m)) return ["bar"];
   if (/(咖啡|cafe)/i.test(m)) return ["cafe"];
-  if (/(餐厅|吃|美食|restaurant)/i.test(m)) return ["restaurant"];
+  if (/(烤肉|烧肉)/i.test(m)) return ["korean_restaurant", "barbecue_restaurant"];
+  if (/(烧烤|bbq|barbecue)/i.test(m)) return ["barbecue_restaurant"];
+  if (/(餐厅|吃|美食|夜宵|宵夜|restaurant)/i.test(m)) return ["restaurant"];
   return [];
 }
 
@@ -125,6 +140,24 @@ function isRetailNearbyIntent(includedTypes: string[], userMessage: string): boo
   return false;
 }
 
+function isOpenNowRequest(userMessage: string): boolean {
+  const msg = (userMessage || "").trim();
+  if (!msg) return false;
+  return [
+    /只看.*(?:营业|开门|开着)/,
+    /(?:正在营业|营业中|还开|开着|开门|没打烊|没有打烊|未打烊|不打烊)/,
+    /(?:不要|别|排除|不想要|不看).*打烊/,
+    /(?:没有|没|未|不).*打烊/,
+    /(?:现在|当前|此时|这会儿|马上).*(?:营业|开门|开着|能去)/,
+    /(?:夜宵|宵夜)/,
+    /open\s*now/i,
+  ].some((re) => re.test(msg));
+}
+
+function filterPlacesByOpenNow(places: Place[]): Place[] {
+  return places.filter((place) => place.openNow === true);
+}
+
 function normalizeClientTextQuery(params: { userMessage: string; textQuery: string }): string {
   const { userMessage, textQuery } = params;
   let q = (textQuery || userMessage || "").trim();
@@ -139,6 +172,21 @@ function normalizeClientTextQuery(params: { userMessage: string; textQuery: stri
   if (!q) q = (textQuery || "").trim() || (userMessage || "").trim();
 
   // Canonicalize a few high-signal intents to reduce "地标词"污染.
+  if (/(咖啡|咖啡店|咖啡厅|咖啡馆|cafe|coffee)/i.test(userMessage) || /(咖啡|cafe|coffee)/i.test(q)) {
+    return "cafe";
+  }
+  if (/(酒吧|bar|鸡尾酒|cocktail)/i.test(userMessage) || /(bar|cocktail)/i.test(q)) {
+    return "bar";
+  }
+  if (/(烤肉|烧肉|烧烤|bbq|barbecue)/i.test(userMessage) || /(烤肉|烧肉|烧烤|bbq|barbecue)/i.test(q)) {
+    return "barbecue restaurant";
+  }
+  if (
+    /(餐厅|吃|美食|晚餐|午餐|早餐|夜宵|宵夜|restaurant|food)/i.test(userMessage) ||
+    /(餐厅|restaurant|food)/i.test(q)
+  ) {
+    return "restaurant";
+  }
   if (/(商场|购物|逛街|mall|shopping)/i.test(userMessage)) return "shopping mall";
   if (/(便利店|convenience|7-11|7eleven|seven eleven|罗森|lawson|全家|familymart)/i.test(userMessage)) return "convenience store";
   if (/(买手店|选品店|boutique|select shop|服装店|衣服|古着|vintage)/i.test(userMessage)) return "boutique";
@@ -183,6 +231,35 @@ function filterPlacesByConvenienceIntent(params: { places: Place[]; includedType
   return kept.length >= 5 ? kept : places;
 }
 
+function filterPlacesByRestaurantIntent(params: { places: Place[]; includedTypes: string[]; strict?: boolean }): Place[] {
+  const { places, includedTypes, strict = false } = params;
+  const types = includedTypes.map((t) => String(t).toLowerCase());
+  const want = types.some((t) =>
+    t === "restaurant" ||
+    t === "cafe" ||
+    t === "bar" ||
+    t.includes("restaurant")
+  );
+  if (!want) return places;
+
+  const kept = places.filter((p) => {
+    const placeTypes = [(p.primaryType || ""), ...(p.types || [])].map((t) => String(t).toLowerCase());
+    return placeTypes.some((t) =>
+      t === "restaurant" ||
+      t === "cafe" ||
+      t === "bar" ||
+      t === "bakery" ||
+      t === "meal_takeaway" ||
+      t === "meal_delivery" ||
+      t === "coffee_shop" ||
+      t.includes("restaurant") ||
+      t.includes("food")
+    );
+  });
+
+  return strict ? kept : kept.length >= 3 ? kept : places;
+}
+
 function mergePlacesPreservingOrder(primary: Place[], fallback: Place[], limit?: number): Place[] {
   const merged: Place[] = [];
   const seen = new Set<string>();
@@ -225,9 +302,10 @@ function buildPlacesCacheKey(params: {
   lat: number;
   lng: number;
   radius?: number;
+  openNowOnly?: boolean;
 }) {
-  const { textQuery, lat, lng, radius = 5000 } = params;
-  return `gmaps_search_${encodeURIComponent(textQuery)}_${roundCoord(lat)}_${roundCoord(lng)}_${radius}`;
+  const { textQuery, lat, lng, radius = 5000, openNowOnly = false } = params;
+  return `gmaps_search_${encodeURIComponent(textQuery)}_${roundCoord(lat)}_${roundCoord(lng)}_${radius}_${openNowOnly ? "open" : "any"}`;
 }
 
 function getCachedPlaces(cacheKey: string): CachedPlacesSearch | null {
@@ -388,6 +466,7 @@ async function clientSearchPlaces(params: {
   lng: number;
   radius: number;
   nextPageToken?: string;
+  openNowOnly?: boolean;
 }): Promise<{ places: Place[]; nextPageToken: string | null }> {
   const apiKey = process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY;
   if (!apiKey) {
@@ -416,6 +495,7 @@ async function clientSearchPlaces(params: {
                 radius: params.radius,
               },
             },
+            ...(params.openNowOnly ? { openNow: true } : {}),
             maxResultCount: 20,
           }
     ),
@@ -435,10 +515,278 @@ async function clientSearchPlaces(params: {
 export interface ChatState {
   messages: (ChatMessage & { id: string })[];
   isLoading: boolean;
+  isHydratingHistory: boolean;
   error: string | null;
   recommendedPlaces: Place[];
   allPlaces: Place[]; // 存储所有获取的地点（20个），用于"换一批"
   nextPageToken: string | null;
+  activeSessionId: string | null;
+  hasMoreHistory: boolean;
+}
+
+type LastPlacesSearchContext = {
+  textQuery: string;
+  latitude: number;
+  longitude: number;
+  radius: number;
+  includedTypes: string[];
+  places: Place[];
+};
+
+type SearchAnchor = {
+  lat: number;
+  lng: number;
+  address?: string;
+  timezone?: string;
+  source?: Location["source"];
+};
+
+const LOCATION_SESSION_ROTATION_DISTANCE_METERS = 30_000;
+
+type EnsureActiveChatSessionResult = {
+  session: PersistedChatSession | null;
+  startedFresh: boolean;
+  rotationReason: "missing" | "timeout" | "location" | null;
+  hasOlderHistory: boolean;
+};
+
+function locationFromSessionSnapshot(snapshot: PersistedChatSession["location_snapshot"]): Location | null {
+  if (!snapshot || typeof snapshot !== "object") return null;
+
+  const lat = snapshot.lat;
+  const lng = snapshot.lng;
+  if (typeof lat !== "number" || typeof lng !== "number") return null;
+
+  return {
+    lat,
+    lng,
+    address: typeof snapshot.address === "string" ? snapshot.address : undefined,
+    timezone: typeof snapshot.timezone === "string" ? snapshot.timezone : undefined,
+    source:
+      snapshot.source === "browser" ||
+      snapshot.source === "manual" ||
+      snapshot.source === "profile" ||
+      snapshot.source === "fallback"
+        ? snapshot.source
+        : undefined,
+  };
+}
+
+function searchAnchorToLocation(anchor: SearchAnchor | null): Location | null {
+  if (!anchor) return null;
+  return {
+    lat: anchor.lat,
+    lng: anchor.lng,
+    address: anchor.address,
+    timezone: anchor.timezone,
+    source: anchor.source,
+  };
+}
+
+function searchAnchorFromContext(context: LastPlacesSearchContext | null): SearchAnchor | null {
+  if (!context) return null;
+  if (!Number.isFinite(context.latitude) || !Number.isFinite(context.longitude)) return null;
+  return {
+    lat: context.latitude,
+    lng: context.longitude,
+    source: "manual",
+  };
+}
+
+function searchAnchorFromSnapshot(snapshot: unknown): SearchAnchor | null {
+  if (!snapshot || typeof snapshot !== "object") return null;
+
+  const candidate = snapshot as Record<string, unknown>;
+  const lat = typeof candidate.lat === "number" ? candidate.lat : NaN;
+  const lng = typeof candidate.lng === "number" ? candidate.lng : NaN;
+
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    return null;
+  }
+
+  return {
+    lat,
+    lng,
+    address: typeof candidate.address === "string" ? candidate.address : undefined,
+    timezone: typeof candidate.timezone === "string" ? candidate.timezone : undefined,
+    source:
+      candidate.source === "browser" ||
+      candidate.source === "manual" ||
+      candidate.source === "profile" ||
+      candidate.source === "fallback"
+        ? candidate.source
+        : "manual",
+  };
+}
+
+function extractLastExplicitLocationHint(messages: Array<ChatMessage & { id: string }>) {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message || message.role !== "user") continue;
+
+    const meta = message.meta;
+    if (meta && typeof meta === "object") {
+      const explicitLocation = searchAnchorFromSnapshot((meta as Record<string, unknown>).explicitLocation);
+      if (explicitLocation) {
+        return { anchor: explicitLocation, locationText: null as string | null };
+      }
+
+      const explicitLocationText = (meta as Record<string, unknown>).explicitLocationText;
+      if (typeof explicitLocationText === "string" && explicitLocationText.trim()) {
+        return { anchor: null as SearchAnchor | null, locationText: explicitLocationText.trim() };
+      }
+    }
+
+    const locationText = extractLocationFromMessage(message.content);
+    if (locationText) {
+      return { anchor: null as SearchAnchor | null, locationText };
+    }
+  }
+
+  return null;
+}
+
+function extractLastPlacesSearchContext(messages: Array<ChatMessage & { id: string }>): LastPlacesSearchContext | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+    if (!message) continue;
+
+    const meta = message.meta;
+    if (!meta || typeof meta !== "object") continue;
+
+    const searchContext = (meta as Record<string, unknown>).searchContext;
+    if (!searchContext || typeof searchContext !== "object") continue;
+
+    const candidate = searchContext as Record<string, unknown>;
+    const textQuery = typeof candidate.textQuery === "string" ? candidate.textQuery : "";
+    const latitude = typeof candidate.latitude === "number" ? candidate.latitude : NaN;
+    const longitude = typeof candidate.longitude === "number" ? candidate.longitude : NaN;
+    const radius = typeof candidate.radius === "number" ? candidate.radius : 5000;
+    const includedTypes = Array.isArray(candidate.includedTypes)
+      ? candidate.includedTypes.filter((value): value is string => typeof value === "string")
+      : [];
+
+    if (!textQuery || !Number.isFinite(latitude) || !Number.isFinite(longitude)) {
+      continue;
+    }
+
+    const snapshots = Array.isArray(message.placesSnapshot)
+      ? message.placesSnapshot.map(normalizePlaceSnapshot).filter((place): place is Place => place !== null)
+      : [];
+
+    return {
+      textQuery,
+      latitude,
+      longitude,
+      radius,
+      includedTypes,
+      places: snapshots,
+    };
+  }
+
+  return null;
+}
+
+function resolveLatestSearchContext(
+  messages: Array<ChatMessage & { id: string }>,
+  refContext: LastPlacesSearchContext | null
+): LastPlacesSearchContext | null {
+  return extractLastPlacesSearchContext(messages) || refContext;
+}
+
+function didSessionLocationChange(session: PersistedChatSession | null, nextLocation: Location | null) {
+  if (!session || !nextLocation) return false;
+
+  const previousLocation = locationFromSessionSnapshot(session.location_snapshot);
+  if (!previousLocation) return false;
+
+  return haversineMeters(previousLocation, nextLocation) >= LOCATION_SESSION_ROTATION_DISTANCE_METERS;
+}
+
+function normalizePlaceSnapshot(place: unknown): Place | null {
+  if (!place || typeof place !== "object") return null;
+
+  const candidate = place as Partial<Place>;
+  if (typeof candidate.id !== "string" || typeof candidate.name !== "string") return null;
+
+  return {
+    id: candidate.id,
+    name: candidate.name,
+    address: typeof candidate.address === "string" ? candidate.address : "",
+    location:
+      candidate.location &&
+      typeof candidate.location === "object" &&
+      typeof candidate.location.lat === "number" &&
+      typeof candidate.location.lng === "number"
+        ? { lat: candidate.location.lat, lng: candidate.location.lng }
+        : undefined,
+    rating: typeof candidate.rating === "number" ? candidate.rating : 0,
+    userRatingsTotal:
+      typeof candidate.userRatingsTotal === "number" ? candidate.userRatingsTotal : 0,
+    priceLevel: typeof candidate.priceLevel === "number" ? candidate.priceLevel : undefined,
+    openNow: typeof candidate.openNow === "boolean" ? candidate.openNow : undefined,
+    photos: Array.isArray(candidate.photos)
+      ? candidate.photos.filter((photo): photo is string => typeof photo === "string")
+      : undefined,
+    reason: typeof candidate.reason === "string" ? candidate.reason : undefined,
+    primaryType: typeof candidate.primaryType === "string" ? candidate.primaryType : undefined,
+    types: Array.isArray(candidate.types)
+      ? candidate.types.filter((type): type is string => typeof type === "string")
+      : undefined,
+  };
+}
+
+function extractPlacesFromMessages(messages: Array<ChatMessage & { id: string }>) {
+  const allPlacesMap = new Map<string, Place>();
+  let latestRecommendedPlaces: Place[] = [];
+
+  for (const message of messages) {
+    const snapshots = Array.isArray(message.placesSnapshot)
+      ? message.placesSnapshot.map(normalizePlaceSnapshot).filter((place): place is Place => place !== null)
+      : [];
+
+    for (const place of snapshots) {
+      if (!allPlacesMap.has(place.id)) {
+        allPlacesMap.set(place.id, place);
+      }
+    }
+
+    if (!message.recommendations || message.recommendations.length === 0 || snapshots.length === 0) {
+      continue;
+    }
+
+    const snapshotMap = new Map(snapshots.map((place) => [place.id, place] as const));
+    const resolved = message.recommendations
+      .map((rec): Place | null => {
+        const place = snapshotMap.get(rec.id);
+        if (!place) return null;
+        return {
+          ...place,
+          reason: rec.reason || place.reason || "",
+        };
+      })
+      .filter((place): place is Place => place !== null);
+
+    if (resolved.length > 0) {
+      latestRecommendedPlaces = resolved;
+    }
+  }
+
+  return {
+    allPlaces: Array.from(allPlacesMap.values()),
+    recommendedPlaces: latestRecommendedPlaces,
+  };
+}
+
+function buildGuestWelcomeMessage(): ChatMessage & { id: string } {
+  return {
+    id: "welcome",
+    role: "assistant",
+    messageType: "assistant",
+    createdAt: new Date().toISOString(),
+    content:
+      "我是给 P 人准备的旅行助手。\n\n不用提前做攻略，也不用先查一堆店。你只要告诉我你此时此刻在哪、现在想干嘛，我就能按当前位置直接推荐附近去处。\n\n目前支持日本、泰国、香港、越南和韩国。\n\n比如你可以直接说：\n- 我在涩谷站附近，想吃烧肉\n- 我刚到尖沙咀，想找家咖啡店坐一下\n- 我在首尔圣水洞，想逛逛买手店\n- 我在胡志明市第一郡，附近有没有越南菜推荐",
+  };
 }
 
 function buildReasonCacheKey(place: Place) {
@@ -565,7 +913,6 @@ async function generateReasonsForPlaces(places: Place[]): Promise<{ intro: strin
 
   const missing = places.filter((p) => !cachedById.has(p.id));
   if (missing.length === 0) {
-    console.log("[generateReasonsForPlaces] cache=hit places=", places.length);
     return {
       intro: "已为你补齐推荐文案：",
       recommendations: places.map((p) => ({ id: p.id, reason: cachedById.get(p.id) || "" })),
@@ -628,10 +975,6 @@ ${missingListText}
   if (!recommendations || recommendations.length === 0) {
     // Graceful degradation: if the model ignored JSON constraints, never keep skeleton forever.
     // Generate safe, field-grounded copy locally.
-    if (rawText) {
-      console.warn("[generateReasonsForPlaces] Model returned non-JSON; using local fallback reasons.");
-    }
-    console.log("[generateReasonsForPlaces] source=fallback places=", places.length);
     // Cache fallback copy too, so we don't repeatedly wait on a failing LLM in this session.
     for (const p of places) {
       const r = buildFallbackReasonForPlace(p);
@@ -653,7 +996,6 @@ ${missingListText}
     }
   }
 
-  console.log("[generateReasonsForPlaces] source=llm recs=", recommendations.length);
   return {
     intro: intro || `再给你换一批，这次是${places.length}家：`,
     recommendations: places.map((p) => ({
@@ -680,18 +1022,33 @@ const SYSTEM_PROMPT = `你是 P-Person Travel Assistant，一个面向不想提�
 1. 用自然语言确认用户的需求
 2. 告诉用户你正在搜索推荐`;
 
+function sanitizeExtractedLocation(candidate: string): string | null {
+  const cleaned = candidate
+    .replace(/^(?:我在|现在在|在)/, "")
+    .replace(/(?:想吃|想喝|想逛|推荐|有没有|有吗|拉面店|拉面|餐厅|咖啡店|咖啡|买手店|逛逛).*$/i, "")
+    .replace(/[，,、。？！!?\s]+$/g, "")
+    .trim();
+
+  if (!cleaned) return null;
+  if (/^(?:附近|周边|边上|旁边|这边|这里|这儿)$/.test(cleaned)) return null;
+  if (cleaned.length > 30) return null;
+  return cleaned;
+}
+
 // Simple location keyword detection
 function extractLocationFromMessage(message: string): string | null {
   const patterns = [
     /我在(.+?)(?:附近|边上|旁边)/,
     /现在在(.+?)(?:附近|边上|旁边)/,
     /在(.+?)(?:附近|边上|旁边)/,
+    /^(.+?)(?:附近|周边|一带)(?:的|\b)/,
   ];
 
   for (const pattern of patterns) {
     const match = message.match(pattern);
     if (match && match[1]) {
-      return match[1].trim();
+      const sanitized = sanitizeExtractedLocation(match[1]);
+      if (sanitized) return sanitized;
     }
   }
 
@@ -716,20 +1073,17 @@ function isRestaurantRequest(message: string): boolean {
 }
 
 export function useChat() {
+  const { user, client, isLoading: isAuthLoading } = useAuthContext();
   const [state, setState] = useState<ChatState>({
-    messages: [
-      {
-        id: "welcome",
-        role: "assistant",
-        content:
-          "我是给 P 人准备的旅行助手。\n\n不用提前做攻略，也不用先查一堆店。你只要告诉我你此时此刻在哪、现在想干嘛，我就能按当前位置直接推荐附近去处。\n\n目前支持日本、泰国、香港、越南和韩国。\n\n比如你可以直接说：\n- 我在涩谷站附近，想吃烧肉\n- 我刚到尖沙咀，想找家咖啡店坐一下\n- 我在首尔圣水洞，想逛逛买手店\n- 我在胡志明市第一郡，附近有没有越南菜推荐",
-      },
-    ],
+    messages: [buildGuestWelcomeMessage()],
     isLoading: false,
+    isHydratingHistory: false,
     error: null,
     recommendedPlaces: [],
     allPlaces: [], // 存储所有获取的地点
     nextPageToken: null,
+    activeSessionId: null,
+    hasMoreHistory: false,
   });
 
   const { updateLocation, geocode, location } = useLocationContext();
@@ -751,6 +1105,11 @@ export function useChat() {
 
   const nextPageTokenRef = useRef<string | null>(state.nextPageToken);
   nextPageTokenRef.current = state.nextPageToken;
+  const activeSessionIdRef = useRef<string | null>(state.activeSessionId);
+  activeSessionIdRef.current = state.activeSessionId;
+  const lastPlacesSearchContextRef = useRef<LastPlacesSearchContext | null>(null);
+  const lastSearchAnchorRef = useRef<SearchAnchor | null>(null);
+  const oldestLoadedSessionRef = useRef<PersistedChatSession | null>(null);
 
   // Cursor-based paging for "换一批". Stable across re-renders and avoids closure traps.
   const placeOffsetRef = useRef<number>(0);
@@ -758,11 +1117,196 @@ export function useChat() {
   const exhaustedRef = useRef<boolean>(false);
   const loadMoreInFlightRef = useRef<boolean>(false);
 
+  const buildInitialSystemMessage = useCallback((timezone?: string | null) => ({
+    id: `system-${Date.now()}`,
+    role: "system" as const,
+    messageType: "system" as const,
+    content: "已为你准备好新的即时旅行对话。",
+    meta: { timezone: timezone ?? null, systemKind: "welcome" },
+    createdAt: new Date().toISOString(),
+  }), []);
+
+  const buildInitialAssistantMessage = useCallback(() => ({
+    id: `assistant-${Date.now()}`,
+    role: "assistant" as const,
+    messageType: "assistant" as const,
+    content:
+      "告诉我你现在在哪、想做什么，我会直接按当前位置帮你推荐附近去处。",
+    createdAt: new Date().toISOString(),
+  }), []);
+
+  const buildRenewedSystemMessage = useCallback((timezone?: string | null) => ({
+    id: `system-${Date.now()}`,
+    role: "system" as const,
+    messageType: "system" as const,
+    content: "距离上次对话已经有一段时间了，我先按你当前的位置重新开始。",
+    meta: { timezone: timezone ?? null, systemKind: "renewed" },
+    createdAt: new Date().toISOString(),
+  }), []);
+
+  const buildLocationSwitchedSystemMessage = useCallback(() => ({
+    id: `system-${Date.now()}`,
+    role: "system" as const,
+    messageType: "system" as const,
+    content: "已切换地点，开启新对话",
+    meta: { systemKind: "location-switched" },
+    createdAt: new Date().toISOString(),
+  }), []);
+
+  const buildRenewedAssistantMessage = useCallback(() => ({
+    id: `assistant-${Date.now()}`,
+    role: "assistant" as const,
+    messageType: "assistant" as const,
+    content: "这次想吃点什么、逛什么，或者想去哪一带看看？",
+    createdAt: new Date().toISOString(),
+  }), []);
+
   const resetPlaceCursor = useCallback(() => {
     placeOffsetRef.current = 0;
     shownPlaceIdsRef.current = new Set();
     exhaustedRef.current = false;
+    lastPlacesSearchContextRef.current = null;
+    lastSearchAnchorRef.current = null;
+    oldestLoadedSessionRef.current = null;
   }, []);
+
+  const setFreshChatState = useCallback((
+    messages: Array<ChatMessage & { id: string }>,
+    sessionId: string | null,
+    hasMoreHistory: boolean,
+    oldestSession?: PersistedChatSession | null
+  ) => {
+    resetPlaceCursor();
+    oldestLoadedSessionRef.current = oldestSession ?? null;
+    const { allPlaces, recommendedPlaces } = extractPlacesFromMessages(messages);
+    const lastSearchContext = extractLastPlacesSearchContext(messages);
+    if (lastSearchContext) {
+      lastPlacesSearchContextRef.current = lastSearchContext;
+      lastSearchAnchorRef.current = {
+        lat: lastSearchContext.latitude,
+        lng: lastSearchContext.longitude,
+        source: "manual",
+      };
+    }
+    if (allPlaces.length > 0) {
+      shownPlaceIdsRef.current = new Set(allPlaces.map((place) => place.id));
+    }
+    setState((prev) => ({
+      ...prev,
+      messages,
+      recommendedPlaces,
+      allPlaces,
+      nextPageToken: null,
+      activeSessionId: sessionId,
+      hasMoreHistory,
+      isHydratingHistory: false,
+      error: null,
+    }));
+  }, [resetPlaceCursor]);
+
+  const appendMessagesToSession = useCallback(async (
+    sessionId: string,
+    messagesToPersist: Array<ChatMessage & { id: string }>
+  ) => {
+    if (!client || !user || messagesToPersist.length === 0) return messagesToPersist;
+    const persisted = await appendChatMessages(
+      client,
+      messagesToPersist.map((message) =>
+        serializeChatMessage(message, { sessionId, userId: user.id })
+      )
+    );
+    return persisted.map(deserializeChatMessage);
+  }, [client, user]);
+
+  const ensureActiveChatSession = useCallback(async (options?: {
+    location?: Location | null;
+    rotateOnLocationChange?: boolean;
+    skipBootstrap?: boolean;
+  }): Promise<EnsureActiveChatSessionResult> => {
+    if (!client || !user) {
+      return { session: null, startedFresh: false, rotationReason: null, hasOlderHistory: false };
+    }
+
+    const targetLocation = options?.location ?? locationRef.current;
+
+    const profile = await getProfile(client, user.id);
+    const activeSessionId = profile?.active_session_id || null;
+    const hadActiveSession = !!activeSessionId;
+    let session =
+      hadActiveSession
+        ? await getChatSession(client, activeSessionId)
+        : await getLatestChatSession(client, user.id);
+    const hadAnySession = !!session;
+    const rotatedByTimeout = !!session && shouldRotateSession(session);
+    const rotatedByLocation =
+      !!session &&
+      options?.rotateOnLocationChange === true &&
+      didSessionLocationChange(session, targetLocation);
+    const shouldStartFresh = !session || rotatedByTimeout || rotatedByLocation;
+
+    if (shouldStartFresh) {
+      if (session) {
+        try {
+          // Best-effort close of the previous session.
+          await client
+            .from("chat_sessions")
+            .update({
+              status: "closed",
+              ended_at: new Date().toISOString(),
+            })
+            .eq("id", session.id);
+        } catch (error) {
+          console.warn("[chat] Failed to close previous session:", error);
+        }
+      }
+
+      session = await createChatSession(client, {
+        userId: user.id,
+        location: targetLocation,
+      });
+
+      if (!options?.skipBootstrap) {
+        const bootstrapMessages =
+          !hadAnySession
+            ? [buildInitialSystemMessage(targetLocation?.timezone), buildInitialAssistantMessage()]
+            : rotatedByLocation
+              ? [buildLocationSwitchedSystemMessage(), buildRenewedAssistantMessage()]
+              : [buildRenewedSystemMessage(targetLocation?.timezone), buildRenewedAssistantMessage()];
+
+        const persistedBootstrap = await appendMessagesToSession(session.id, bootstrapMessages);
+        setFreshChatState(persistedBootstrap, session.id, hadAnySession, session);
+      } else {
+        resetPlaceCursor();
+        oldestLoadedSessionRef.current = session;
+      }
+
+      return {
+        session,
+        startedFresh: true,
+        rotationReason: !hadAnySession ? "missing" : rotatedByLocation ? "location" : "timeout",
+        hasOlderHistory: hadAnySession,
+      };
+    }
+
+    oldestLoadedSessionRef.current = session;
+    setState((prev) => ({
+      ...prev,
+      activeSessionId: session?.id ?? null,
+    }));
+
+    return { session, startedFresh: false, rotationReason: null, hasOlderHistory: false };
+  }, [
+    appendMessagesToSession,
+    buildInitialAssistantMessage,
+    buildInitialSystemMessage,
+    buildLocationSwitchedSystemMessage,
+    buildRenewedAssistantMessage,
+    buildRenewedSystemMessage,
+    client,
+    resetPlaceCursor,
+    setFreshChatState,
+    user,
+  ]);
 
   const seedShownPlaces = useCallback((places: Place[]) => {
     // Mark already-rendered recommendations as shown so "换一批" never repeats them.
@@ -770,6 +1314,143 @@ export function useChat() {
     for (const place of places) set.add(place.id);
     shownPlaceIdsRef.current = set;
   }, []);
+
+  useEffect(() => {
+    if (isAuthLoading) return;
+
+    if (!user || !client) {
+      resetPlaceCursor();
+      setState((prev) => ({
+        ...prev,
+        messages: [buildGuestWelcomeMessage()],
+        recommendedPlaces: [],
+        allPlaces: [],
+        nextPageToken: null,
+        activeSessionId: null,
+        hasMoreHistory: false,
+        isHydratingHistory: false,
+        isLoading: false,
+        error: null,
+      }));
+      return;
+    }
+
+    let cancelled = false;
+
+    const bootstrapHistory = async () => {
+      setState((prev) => ({ ...prev, isHydratingHistory: true }));
+
+      try {
+        const { session } = await ensureActiveChatSession();
+        if (!session || cancelled) {
+          setState((prev) => ({ ...prev, isHydratingHistory: false }));
+          return;
+        }
+
+        const sessionLocation = locationFromSessionSnapshot(session.location_snapshot);
+
+        const rows = await fetchChatMessagesPage(client, {
+          sessionId: session.id,
+          limit: INITIAL_MESSAGE_PAGE_SIZE,
+        });
+
+        if (cancelled) return;
+
+        if (rows.length === 0) {
+          const previousSession = session.last_message_at
+            ? await getPreviousChatSession(client, {
+                userId: user.id,
+                beforeLastMessageAt: session.last_message_at,
+                excludeSessionId: session.id,
+              })
+            : null;
+          const bootstrapMessages = [buildInitialSystemMessage(location?.timezone), buildInitialAssistantMessage()];
+          const persistedBootstrap = await appendMessagesToSession(session.id, bootstrapMessages);
+          setFreshChatState(persistedBootstrap, session.id, !!previousSession, session);
+          if (sessionLocation) {
+            await updateLocation(sessionLocation, { persist: false });
+          }
+          return;
+        }
+
+        const previousSession = session.last_message_at
+          ? await getPreviousChatSession(client, {
+              userId: user.id,
+              beforeLastMessageAt: session.last_message_at,
+              excludeSessionId: session.id,
+            })
+          : null;
+        const hydratedMessages = rows.map(deserializeChatMessage);
+        const restoredSearchContext = extractLastPlacesSearchContext(hydratedMessages);
+        const explicitLocationHint =
+          restoredSearchContext ? null : extractLastExplicitLocationHint(hydratedMessages);
+        let restoredExplicitAnchor: SearchAnchor | null = explicitLocationHint?.anchor ?? null;
+        if (!restoredExplicitAnchor && explicitLocationHint?.locationText) {
+          try {
+            const geocodedLocation = await geocode(explicitLocationHint.locationText);
+            if (geocodedLocation) {
+              restoredExplicitAnchor = {
+                lat: geocodedLocation.lat,
+                lng: geocodedLocation.lng,
+                address: geocodedLocation.address,
+                timezone: geocodedLocation.timezone,
+                source: geocodedLocation.source ?? "manual",
+              };
+            }
+          } catch (error) {
+            console.warn("[chat] Failed to restore explicit location hint:", error);
+          }
+        }
+        setFreshChatState(
+          hydratedMessages,
+          session.id,
+          rows.length >= INITIAL_MESSAGE_PAGE_SIZE || !!previousSession,
+          session
+        );
+        const restoredAnchor = restoredSearchContext
+          ? searchAnchorToLocation({
+              lat: restoredSearchContext.latitude,
+              lng: restoredSearchContext.longitude,
+              source: "manual",
+            })
+          : null;
+        if (!restoredSearchContext && restoredExplicitAnchor) {
+          lastSearchAnchorRef.current = restoredExplicitAnchor;
+        }
+        const locationToRestore =
+          restoredAnchor ||
+          searchAnchorToLocation(restoredExplicitAnchor) ||
+          sessionLocation;
+        if (locationToRestore) {
+          await updateLocation(locationToRestore, { persist: false });
+        }
+      } catch (error) {
+        console.warn("[chat] Failed to bootstrap history:", error);
+        if (!cancelled) {
+          setState((prev) => ({ ...prev, isHydratingHistory: false }));
+        }
+      }
+    };
+
+    void bootstrapHistory();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [
+    buildGuestWelcomeMessage,
+    buildInitialAssistantMessage,
+    buildInitialSystemMessage,
+    client,
+    ensureActiveChatSession,
+    isAuthLoading,
+    location?.timezone,
+    resetPlaceCursor,
+    setFreshChatState,
+    geocode,
+    updateLocation,
+    user,
+  ]);
 
   const appendPlacesDeduped = useCallback((incoming: Place[]) => {
     if (!incoming || incoming.length === 0) return;
@@ -784,6 +1465,20 @@ export function useChat() {
   }, []);
 
   const fetchNextPagePlaces = useCallback(async (token: string) => {
+    if (process.env.NODE_ENV !== "production") {
+      const fallback = await clientSearchPlaces({
+        textQuery: "restaurant",
+        lat: 0,
+        lng: 0,
+        radius: 5000,
+        nextPageToken: token,
+      });
+      return {
+        places: fallback.places.map((place) => ({ ...place, reason: "" })),
+        nextPageToken: fallback.nextPageToken,
+      };
+    }
+
     const response = await fetch("/api/places", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
@@ -792,20 +1487,6 @@ export function useChat() {
 
     const data = await response.json();
     if (!response.ok) {
-      if (process.env.NODE_ENV !== "production") {
-        console.warn("[Places] Falling back to direct next-page request in development");
-        const fallback = await clientSearchPlaces({
-          textQuery: "restaurant",
-          lat: 0,
-          lng: 0,
-          radius: 5000,
-          nextPageToken: token,
-        });
-        return {
-          places: fallback.places.map((place) => ({ ...place, reason: "" })),
-          nextPageToken: fallback.nextPageToken,
-        };
-      }
       throw new Error(data?.error || "Failed to load next page");
     }
 
@@ -830,6 +1511,27 @@ export function useChat() {
     }
 
     try {
+      if (process.env.NODE_ENV !== "production") {
+        const fallback = await clientSearchPlaces({
+          textQuery: query || "restaurant",
+          lat: loc.lat,
+          lng: loc.lng,
+          radius: 5000,
+        });
+        const fallbackPlaces = fallback.places.map((p) => ({ ...p, reason: "" }));
+        setCachedPlaces(buildPlacesCacheKey({
+          textQuery: query || "restaurant",
+          lat: loc.lat,
+          lng: loc.lng,
+          radius: 5000,
+        }), {
+          places: fallbackPlaces,
+          nextPageToken: fallback.nextPageToken,
+        });
+        setState(prev => ({ ...prev, recommendedPlaces: fallbackPlaces.filter((p) => p.rating >= 3.0) }));
+        return fallbackPlaces;
+      }
+
       // Get API config from our server
       const response = await fetch("/api/places", {
         method: "POST",
@@ -845,28 +1547,6 @@ export function useChat() {
       const data = await response.json();
 
       if (!response.ok) {
-        console.error("Places search error:", data);
-        if (process.env.NODE_ENV !== "production") {
-          console.warn("[Places] Falling back to direct client request in development");
-          const fallback = await clientSearchPlaces({
-            textQuery: query || "restaurant",
-            lat: loc.lat,
-            lng: loc.lng,
-            radius: 5000,
-          });
-          const fallbackPlaces = fallback.places.map((p) => ({ ...p, reason: "" }));
-          setCachedPlaces(buildPlacesCacheKey({
-            textQuery: query || "restaurant",
-            lat: loc.lat,
-            lng: loc.lng,
-            radius: 5000,
-          }), {
-            places: fallbackPlaces,
-            nextPageToken: fallback.nextPageToken,
-          });
-          setState(prev => ({ ...prev, recommendedPlaces: fallbackPlaces.filter((p) => p.rating >= 3.0) }));
-          return fallbackPlaces;
-        }
         return [];
       }
 
@@ -881,17 +1561,13 @@ export function useChat() {
       let places: Place[] = [];
       let nextPageToken: string | null = null;
       if (cached && cached.places.length > 0 && !isCachePayloadLikelyBroken(cached.places)) {
-        console.log("[Places Cache] HIT", cacheKey);
         places = cached.places;
         nextPageToken = cached.nextPageToken;
       } else {
         if (cached && cached.places.length > 0) {
-          console.log("[Places Cache] STALE", cacheKey);
           try {
             window.sessionStorage.removeItem(cacheKey);
           } catch {}
-        } else {
-          console.log("[Places Cache] MISS", cacheKey);
         }
         places = normalizePlacesFromGoogle(data.places || []).map((p) => ({
           ...p,
@@ -900,7 +1576,6 @@ export function useChat() {
         nextPageToken = data.nextPageToken || null;
       }
 
-      console.log("Places proxy success, places:", places.length);
       setCachedPlaces(cacheKey, { places, nextPageToken });
 
       // Filter by rating
@@ -923,6 +1598,22 @@ export function useChat() {
     if (!loc) return;
 
     try {
+      if (process.env.NODE_ENV !== "production") {
+        const fallback = await clientSearchPlaces({
+          textQuery: keyword || "restaurant",
+          lat: loc.lat,
+          lng: loc.lng,
+          radius: 5000,
+        });
+        setState(prev => ({
+          ...prev,
+          recommendedPlaces: fallback.places
+            .map((p) => ({ ...p, reason: "" }))
+            .filter((p: Place) => p.rating >= 3.0),
+        }));
+        return;
+      }
+
       const response = await fetch("/api/places", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -941,91 +1632,192 @@ export function useChat() {
           .filter((p: Place) => p.rating >= 3.0);
 
         setState(prev => ({ ...prev, recommendedPlaces: places }));
-      } else if (process.env.NODE_ENV !== "production") {
-        console.warn("[Places] Falling back to direct client request in development");
-        const fallback = await clientSearchPlaces({
-          textQuery: keyword || "restaurant",
-          lat: loc.lat,
-          lng: loc.lng,
-          radius: 5000,
-        });
-        setState(prev => ({
-          ...prev,
-          recommendedPlaces: fallback.places
-            .map((p) => ({ ...p, reason: "" }))
-            .filter((p: Place) => p.rating >= 3.0),
-        }));
       }
     } catch (error) {
       console.error("doSearch error:", error);
     }
   }, []);
 
-  const handleLocationUpdate = useCallback(async (message: string) => {
-    const locationText = extractLocationFromMessage(message);
-    if (locationText) {
-      console.log("Detected location:", locationText);
-      try {
-        const result = await geocode(locationText);
-        if (result) {
-          console.log("Geocode result:", result);
-          await updateLocation(result);
-        }
-      } catch (error) {
-        console.error("Location update failed:", error);
-      }
-    }
-  }, [geocode, updateLocation]);
-
   const sendMessage = useCallback(async (content: string) => {
-    console.log("=== [sendMessage] 开始处理消息 ===");
-    console.log("[sendMessage] 步骤1: 初始化状态");
+    const optimisticUserMessage: ChatMessage & { id: string } = {
+      id: `user-pending-${Date.now()}`,
+      role: "user",
+      messageType: "user",
+      content,
+      createdAt: new Date().toISOString(),
+    };
+
+    setState((prev) => ({
+      ...prev,
+      messages: [...prev.messages, optimisticUserMessage],
+      isLoading: true,
+      error: null,
+    }));
 
     if (abortControllerRef.current) {
       abortControllerRef.current.abort();
     }
     abortControllerRef.current = new AbortController();
 
-    const userMessage: ChatMessage & { id: string } = {
-      id: `user-${Date.now()}`,
-      role: "user",
-      content,
-    };
-
-    setState((prev) => ({
-      ...prev,
-      messages: [...prev.messages, userMessage],
-      isLoading: true,
-      error: null,
-    }));
-
-    console.log("[sendMessage] 步骤2: 检测位置关键词");
-
     // Try to detect and update location from user message BEFORE calling AI
     const locationText = extractLocationFromMessage(content);
     let updatedLocation = null;
     if (locationText) {
-      console.log("[sendMessage] 步骤3: 正在 Geocode:", locationText);
       updatedLocation = await geocode(locationText);
       if (updatedLocation) {
-        console.log("[sendMessage] 步骤4: Geocode 成功", updatedLocation);
+        lastSearchAnchorRef.current = {
+          lat: updatedLocation.lat,
+          lng: updatedLocation.lng,
+          address: updatedLocation.address,
+          timezone: updatedLocation.timezone,
+          source: updatedLocation.source,
+        };
         await updateLocation(updatedLocation);
-      } else {
-        console.log("[sendMessage] 步骤4: Geocode 返回 null");
       }
     }
 
-    // Use location from context or updated location
-    const locToUse = updatedLocation || locationRef.current;
-    console.log("[sendMessage] 步骤5: 使用位置", locToUse);
-
     try {
+      const latestSearchContext = resolveLatestSearchContext(
+        messagesRef.current as Array<ChatMessage & { id: string }>,
+        lastPlacesSearchContextRef.current
+      );
+      if (latestSearchContext) {
+        lastPlacesSearchContextRef.current = latestSearchContext;
+      }
+      const searchContextAnchor =
+        searchAnchorToLocation(searchAnchorFromContext(latestSearchContext)) ||
+        searchAnchorToLocation(lastSearchAnchorRef.current);
+      const sessionResult = await ensureActiveChatSession({
+        location: updatedLocation || searchContextAnchor || locationRef.current,
+        rotateOnLocationChange: !!locationText,
+        skipBootstrap: true,
+      });
+      const session = sessionResult.session;
+      const anchorLocation =
+        searchContextAnchor ||
+        searchAnchorToLocation(lastSearchAnchorRef.current);
+      const sessionLocation = locationFromSessionSnapshot(session?.location_snapshot ?? null);
+      const locToUse = updatedLocation || anchorLocation || sessionLocation || locationRef.current;
+
+      if (process.env.NODE_ENV !== "production") {
+        console.info("[chat][location-resolution]", {
+          content,
+          locationText,
+          updatedLocation,
+          anchorLocation,
+          sessionLocation,
+          currentLocation: locationRef.current,
+          locToUse,
+          lastSearchContext: latestSearchContext
+            ? {
+                textQuery: latestSearchContext.textQuery,
+                latitude: latestSearchContext.latitude,
+                longitude: latestSearchContext.longitude,
+                radius: latestSearchContext.radius,
+              }
+            : null,
+        });
+      }
+
+      if (
+        !locationText &&
+        anchorLocation &&
+        (!locationRef.current ||
+          haversineMeters(anchorLocation, locationRef.current) >= 50)
+      ) {
+        try {
+          await updateLocation(anchorLocation, { persist: false });
+        } catch (locationError) {
+          console.warn("[sendMessage] Failed to restore search anchor location:", locationError);
+        }
+      } else if (
+        !locationText &&
+        !anchorLocation &&
+        sessionLocation &&
+        (!locationRef.current ||
+          haversineMeters(sessionLocation, locationRef.current) >= 50)
+      ) {
+        try {
+          await updateLocation(sessionLocation, { persist: false });
+        } catch (locationError) {
+          console.warn("[sendMessage] Failed to restore session location:", locationError);
+        }
+      }
+
+      const shouldResetModelContext = sessionResult.startedFresh;
+      const boundaryMessages =
+        shouldResetModelContext && sessionResult.rotationReason === "location"
+          ? [(() => {
+              const boundary = buildLocationSwitchedSystemMessage();
+              const userCreatedAt = optimisticUserMessage.createdAt || new Date().toISOString();
+              const userCreatedAtMs = new Date(userCreatedAt).getTime();
+              if (Number.isFinite(userCreatedAtMs)) {
+                boundary.createdAt = new Date(userCreatedAtMs - 1).toISOString();
+              }
+              return boundary;
+            })()]
+          : [];
+      const userMessageBase: ChatMessage & { id: string } = {
+        id: `user-${Date.now()}`,
+        role: "user",
+        messageType: "user",
+        content,
+        meta: locationText
+          ? {
+              explicitLocationText: locationText,
+              explicitLocation: updatedLocation
+                ? {
+                    lat: updatedLocation.lat,
+                    lng: updatedLocation.lng,
+                    address: updatedLocation.address ?? null,
+                    timezone: updatedLocation.timezone ?? null,
+                    source: updatedLocation.source ?? "manual",
+                  }
+                : null,
+            }
+          : undefined,
+        createdAt: optimisticUserMessage.createdAt,
+      };
+      const persistedUserMessages =
+        session && client && user
+          ? await appendMessagesToSession(session.id, [...boundaryMessages, userMessageBase])
+          : [...boundaryMessages, userMessageBase];
+      const userMessage = persistedUserMessages[persistedUserMessages.length - 1] || userMessageBase;
+      const persistedBoundaryMessages = persistedUserMessages.slice(0, -1);
+
+      setState((prev) => {
+        if (shouldResetModelContext) {
+          return {
+            ...prev,
+            messages: [...persistedBoundaryMessages, userMessage],
+            recommendedPlaces: [],
+            allPlaces: [],
+            nextPageToken: null,
+            activeSessionId: session?.id ?? prev.activeSessionId,
+            hasMoreHistory: sessionResult.hasOlderHistory,
+          };
+        }
+
+        return {
+          ...prev,
+          messages: prev.messages.map((message) =>
+            message.id === optimisticUserMessage.id ? userMessage : message
+          ),
+          activeSessionId: session?.id ?? prev.activeSessionId,
+        };
+      });
+
       const messages: ChatMessage[] = [
-        ...messagesRef.current.map(({ role, content }) => ({ role, content })),
+        ...(shouldResetModelContext
+          ? []
+          : messagesRef.current.map(({ role, content }) => ({ role, content }))),
         { role: "user", content },
       ];
-
-      console.log("[sendMessage] 步骤6: 调用 /api/chat");
+      const historyMessages = shouldResetModelContext
+        ? []
+        : messagesRef.current
+            .slice(-6)
+            .map(({ role, content }) => ({ role, content }));
 
       const response = await fetch("/api/chat", {
         method: "POST",
@@ -1034,96 +1826,215 @@ export function useChat() {
         },
         body: JSON.stringify({
           messages,
-          historyMessages: messagesRef.current
-            .slice(-6)
-            .map(({ role, content }) => ({ role, content })),
+          historyMessages,
           location: locToUse ? { latitude: locToUse.lat, longitude: locToUse.lng } : null,
         }),
         signal: abortControllerRef.current.signal,
       });
 
-      console.log("[sendMessage] 步骤7: /api/chat 返回", response.status);
-
       if (!response.ok) {
         throw new Error(`API error: ${response.statusText}`);
       }
 
-      const data = await response.json();
-      console.log("[sendMessage] 步骤8: 解析 JSON 响应", data);
+      let data = await response.json();
+      if (
+        locationText &&
+        updatedLocation &&
+        data?.searchParams &&
+        typeof data.searchParams === "object"
+      ) {
+        data = {
+          ...data,
+          searchParams: {
+            ...data.searchParams,
+            latitude: updatedLocation.lat,
+            longitude: updatedLocation.lng,
+          },
+        };
+      }
+
+      if (isOpenNowRequest(content) && !locationText) {
+        const lastSearch = resolveLatestSearchContext(
+          messagesRef.current as Array<ChatMessage & { id: string }>,
+          lastPlacesSearchContextRef.current
+        );
+        if (lastSearch) {
+          lastPlacesSearchContextRef.current = lastSearch;
+        }
+        if (lastSearch) {
+          const localOpenNowPlaces = filterPlacesByOpenNow(
+            filterPlacesByRestaurantIntent({
+              places: lastSearch.places,
+              includedTypes: lastSearch.includedTypes,
+              strict: true,
+            })
+          )
+            .slice()
+            .sort((a, b) => {
+              if ((b.rating || 0) !== (a.rating || 0)) return (b.rating || 0) - (a.rating || 0);
+              return (b.userRatingsTotal || 0) - (a.userRatingsTotal || 0);
+            });
+
+          if (localOpenNowPlaces.length > 0) {
+            const topPlaces = localOpenNowPlaces.slice(0, 5);
+            const recommendations: PlaceRecommendation[] = topPlaces.map((place) => ({
+              id: place.id,
+              reason: getCachedReason(place) || buildFallbackReasonForPlace(place),
+            }));
+            const recommendedPlaces = topPlaces.map((place) => ({
+              ...place,
+              reason: recommendations.find((item) => item.id === place.id)?.reason || "",
+            }));
+            const assistantBase: ChatMessage & { id: string } = {
+              id: `assistant-${Date.now()}`,
+              role: "assistant",
+              messageType: "assistant",
+              content: "为您找到以下几家正在营业的高分好店：",
+              meta: {
+                openNowOnly: true,
+                disableLoadMore: true,
+                searchContext: {
+                  textQuery: lastSearch.textQuery,
+                  latitude: lastSearch.latitude,
+                  longitude: lastSearch.longitude,
+                  radius: lastSearch.radius,
+                  includedTypes: lastSearch.includedTypes,
+                },
+              },
+              placesSnapshot: recommendedPlaces,
+              recommendations,
+              createdAt: new Date().toISOString(),
+            };
+            const persistedAssistant =
+              session && client && user
+                ? (await appendMessagesToSession(session.id, [assistantBase]))[0] || assistantBase
+                : assistantBase;
+
+            resetPlaceCursor();
+            seedShownPlaces(recommendedPlaces);
+            setState((prev) => ({
+              ...prev,
+              messages: [...prev.messages, persistedAssistant],
+              recommendedPlaces,
+              allPlaces: mergePlacesPreservingOrder(prev.allPlaces, localOpenNowPlaces),
+              nextPageToken: null,
+              isLoading: false,
+            }));
+            return;
+          }
+
+          data = {
+            needClientSearch: true,
+            userMessage: content,
+            searchParams: {
+              latitude: lastSearch.latitude,
+              longitude: lastSearch.longitude,
+              radius: lastSearch.radius,
+              textQuery: lastSearch.textQuery,
+              includedTypes: lastSearch.includedTypes,
+              openNowOnly: true,
+            },
+          };
+        }
+      }
 
       // If server needs client to search
       if (data.needClientSearch) {
-        console.log("[sendMessage] 需要客户端搜索");
-
         const rawTextQuery = data.searchParams?.textQuery || "restaurant";
         const centerLat = data.searchParams.latitude;
         const centerLng = data.searchParams.longitude;
         const radius = data.searchParams.radius || 5000;
 
+        if (typeof centerLat === "number" && typeof centerLng === "number") {
+          lastSearchAnchorRef.current = {
+            lat: centerLat,
+            lng: centerLng,
+            source: "manual",
+          };
+          const currentLocation = locationRef.current;
+          const locationDrifted =
+            !currentLocation ||
+            Math.abs(currentLocation.lat - centerLat) > 0.0001 ||
+            Math.abs(currentLocation.lng - centerLng) > 0.0001;
+
+          if (locationDrifted) {
+            try {
+              await updateLocation({ lat: centerLat, lng: centerLng, source: "manual" }, { persist: false });
+            } catch (locationError) {
+              console.warn("[sendMessage] Failed to sync map location from search center:", locationError);
+            }
+          }
+        }
+
         // Backend may send a verbose query containing a landmark that is actually a location context.
         // Normalize it here so we don't accidentally recommend the landmark itself.
         const textQuery = normalizeClientTextQuery({ userMessage: content, textQuery: rawTextQuery });
+        const openNowOnly = data.searchParams?.openNowOnly === true || isOpenNowRequest(content);
 
         const cacheKey = buildPlacesCacheKey({
           textQuery,
           lat: centerLat,
           lng: centerLng,
           radius,
+          openNowOnly,
         });
         try {
           const cached = getCachedPlaces(cacheKey);
           let googleData: any = null;
 
           if (cached && cached.places.length > 0 && !isCachePayloadLikelyBroken(cached.places)) {
-            console.log("[Places Cache] HIT", cacheKey);
             googleData = { places: cached.places, nextPageToken: cached.nextPageToken };
           } else {
             if (cached && cached.places.length > 0) {
-              console.log("[Places Cache] STALE", cacheKey);
               try {
                 window.sessionStorage.removeItem(cacheKey);
               } catch {}
-            } else {
-              console.log("[Places Cache] MISS", cacheKey);
             }
-            const googleResponse = await fetch("/api/places", {
-              method: "POST",
-              headers: {
-                "Content-Type": "application/json",
-              },
-              body: JSON.stringify({
+            if (process.env.NODE_ENV !== "production") {
+              googleData = await clientSearchPlaces({
+                textQuery,
                 lat: centerLat,
                 lng: centerLng,
                 radius,
-                textQuery,
-              }),
-            });
-
-            googleData = await googleResponse.json();
-            if (!googleResponse.ok) {
-              if (process.env.NODE_ENV !== "production") {
-                console.warn("[Places] Falling back to direct client request in development");
-                googleData = await clientSearchPlaces({
-                  textQuery,
+                openNowOnly,
+              });
+            } else {
+              const googleResponse = await fetch("/api/places", {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                },
+                body: JSON.stringify({
                   lat: centerLat,
                   lng: centerLng,
                   radius,
-                });
-              } else {
+                  textQuery,
+                  openNowOnly,
+                }),
+              });
+
+              googleData = await googleResponse.json();
+              if (!googleResponse.ok) {
                 throw new Error(googleData?.error || "Places proxy failed");
               }
             }
-            console.log("Places proxy response:", googleData);
           }
 
           if (!googleData.places || googleData.places.length === 0) {
+            const emptyAssistantBase = {
+              id: `assistant-${Date.now()}`,
+              role: "assistant" as const,
+              messageType: "assistant" as const,
+              content: "抱歉，附近没有找到相关的餐厅。",
+              createdAt: new Date().toISOString(),
+            };
+            const emptyAssistant =
+              session && client && user
+                ? (await appendMessagesToSession(session.id, [emptyAssistantBase]))[0] || emptyAssistantBase
+                : emptyAssistantBase;
             setState((prev) => ({
               ...prev,
-              messages: [...prev.messages, {
-                id: `assistant-${Date.now()}`,
-                role: "assistant",
-                content: "抱歉，附近没有找到相关的餐厅。",
-              }],
+              messages: [...prev.messages, emptyAssistant],
               isLoading: false,
             }));
             return;
@@ -1136,34 +2047,61 @@ export function useChat() {
           // Text Search may return far-away results even with locationBias. Keep results local.
           places = filterPlacesByRadius({ places, centerLat, centerLng, radius });
 
-          console.log("Transformed places:", places.length);
-
-          // Cache the full 20 places for same (textQuery + center coords).
-          setCachedPlaces(cacheKey, {
-            places,
-            nextPageToken: googleData.nextPageToken || null,
-          });
-
           // 🔴 前端数据净化：根据真实意图过滤酒店
           // 从后端返回的 searchParams 获取真实的 includedTypes
           const intentTypes =
             (Array.isArray(data.searchParams?.includedTypes) && data.searchParams.includedTypes.length > 0)
               ? data.searchParams.includedTypes
               : inferIncludedTypesFromUserMessage(content);
-          console.log("[Frontend Filter] 真实意图类型 from backend:", intentTypes);
 
-          let filteredPlaces = filterPlacesByIntent(places, intentTypes);
-          filteredPlaces = filterPlacesByShoppingIntent({ places: filteredPlaces, includedTypes: intentTypes });
-          filteredPlaces = filterPlacesByConvenienceIntent({ places: filteredPlaces, includedTypes: intentTypes });
+          const applySearchFilters = (source: Place[]) => {
+            let next = filterPlacesByIntent(source, intentTypes);
+            next = filterPlacesByShoppingIntent({ places: next, includedTypes: intentTypes });
+            next = filterPlacesByConvenienceIntent({ places: next, includedTypes: intentTypes });
+            next = filterPlacesByRestaurantIntent({ places: next, includedTypes: intentTypes, strict: openNowOnly });
+            if (openNowOnly) {
+              next = filterPlacesByOpenNow(next);
+            }
+            return next;
+          };
+
+          let nextPageToken = googleData.nextPageToken || null;
+          if (openNowOnly && nextPageToken) {
+            let filteredForPaging = applySearchFilters(places);
+            let extraPagesFetched = 0;
+            while (filteredForPaging.length < 5 && nextPageToken && extraPagesFetched < 2) {
+              const nextPage = await fetchNextPagePlaces(nextPageToken);
+              const nextPlaces = filterPlacesByRadius({
+                places: nextPage.places,
+                centerLat,
+                centerLng,
+                radius,
+              });
+              places = mergePlacesPreservingOrder(places, nextPlaces);
+              nextPageToken = nextPage.nextPageToken;
+              filteredForPaging = applySearchFilters(places);
+              extraPagesFetched += 1;
+            }
+          }
+
+          setCachedPlaces(cacheKey, {
+            places,
+            nextPageToken,
+          });
+
+          let filteredPlaces = applySearchFilters(places);
           const filteredPlacesForDisplay =
-            filteredPlaces.length >= 5 ? filteredPlaces : mergePlacesPreservingOrder(filteredPlaces, places);
-          console.log(
-            "[Frontend Filter] 发给 LLM 的纯净数据:",
-            filteredPlaces.length,
-            "个地点；展示回填后:",
-            filteredPlacesForDisplay.length,
-            "个地点"
-          );
+            openNowOnly
+              ? filteredPlaces
+              : filteredPlaces.length >= 5 ? filteredPlaces : mergePlacesPreservingOrder(filteredPlaces, places);
+          lastPlacesSearchContextRef.current = {
+            textQuery,
+            latitude: centerLat,
+            longitude: centerLng,
+            radius,
+            includedTypes: intentTypes,
+            places: filteredPlacesForDisplay,
+          };
 
           const preferDistance = isRetailNearbyIntent(intentTypes, content);
 
@@ -1187,11 +2125,32 @@ export function useChat() {
                 });
 
           const topPlaces = candidates.slice(0, 5);
+          if (openNowOnly && topPlaces.length === 0) {
+            const emptyAssistantBase = {
+              id: `assistant-${Date.now()}`,
+              role: "assistant" as const,
+              messageType: "assistant" as const,
+              content: "附近暂时没筛到明确显示为正在营业、且符合这次条件的地方。你可以放宽一下条件，或者让我按评分先给你一批可能合适的。",
+              createdAt: new Date().toISOString(),
+            };
+            const emptyAssistant =
+              session && client && user
+                ? (await appendMessagesToSession(session.id, [emptyAssistantBase]))[0] || emptyAssistantBase
+                : emptyAssistantBase;
+            setState((prev) => ({
+              ...prev,
+              messages: [...prev.messages, emptyAssistant],
+              isLoading: false,
+            }));
+            return;
+          }
           const immediateReasonMap = new Map<string, string>();
           for (const p of topPlaces) {
             immediateReasonMap.set(p.id, getCachedReason(p) || buildFallbackReasonForPlace(p));
           }
-          const intro = preferDistance ? "在你附近先挑了几家更顺路的：" : "为您找到以下几家高分好店：";
+          const intro = openNowOnly
+            ? "为您找到以下几家正在营业的高分好店："
+            : preferDistance ? "在你附近先挑了几家更顺路的：" : "为您找到以下几家高分好店：";
 	          const recommendations: PlaceRecommendation[] = topPlaces.map((p) => ({
 	            id: p.id,
 	            reason: immediateReasonMap.get(p.id) || "",
@@ -1211,20 +2170,39 @@ export function useChat() {
 
 	          // 一次性更新所有状态
 	          // New search session: reset cursor and replace old place caches after new data is ready.
-	          const assistantId = `assistant-${Date.now()}`;
+	          const assistantBase: ChatMessage & { id: string } = {
+              id: `assistant-${Date.now()}`,
+              role: "assistant",
+              messageType: "assistant",
+              content: intro,
+              meta: {
+                openNowOnly,
+                disableLoadMore: openNowOnly,
+                searchContext: {
+                  textQuery,
+                  latitude: centerLat,
+                  longitude: centerLng,
+                  radius,
+                  includedTypes: intentTypes,
+                },
+              },
+              placesSnapshot: recommendedPlaces,
+              recommendations: recommendations,
+              createdAt: new Date().toISOString(),
+            };
+            const persistedAssistant =
+              session && client && user
+                ? (await appendMessagesToSession(session.id, [assistantBase]))[0] || assistantBase
+                : assistantBase;
+	          const assistantId = persistedAssistant.id;
 	          resetPlaceCursor();
 	          seedShownPlaces(recommendedPlaces);
 	          setState((prev) => ({
 	            ...prev,
-	            messages: [...prev.messages, {
-	              id: assistantId,
-	              role: "assistant",
-	              content: intro,
-	              recommendations: recommendations,
-	            }],
+	            messages: [...prev.messages, persistedAssistant],
 	            recommendedPlaces: recommendedPlaces,
 	            allPlaces: mergePlacesPreservingOrder(prev.allPlaces, allPlacesData),
-	            nextPageToken: googleData.nextPageToken || null,
+	            nextPageToken: openNowOnly ? null : nextPageToken,
 	            isLoading: false,
 	          }));
 
@@ -1258,13 +2236,20 @@ export function useChat() {
 	          return;
 	        } catch (googleError: any) {
 	          console.error("Google API error:", googleError);
+          const errorAssistantBase = {
+            id: `assistant-${Date.now()}`,
+            role: "assistant" as const,
+            messageType: "assistant" as const,
+            content: `抱歉，搜索餐厅时出错：${googleError.message}。请稍后再试。`,
+            createdAt: new Date().toISOString(),
+          };
+          const errorAssistant =
+            session && client && user
+              ? (await appendMessagesToSession(session.id, [errorAssistantBase]))[0] || errorAssistantBase
+              : errorAssistantBase;
           setState((prev) => ({
             ...prev,
-            messages: [...prev.messages, {
-              id: `assistant-${Date.now()}`,
-              role: "assistant",
-              content: `抱歉，搜索餐厅时出错：${googleError.message}。请稍后再试。`,
-            }],
+            messages: [...prev.messages, errorAssistant],
             isLoading: false,
           }));
           return;
@@ -1273,23 +2258,14 @@ export function useChat() {
 
       // 防范坑点2：等消息接收完毕后再解析 JSON（非流式可以直接处理）
       const { intro, recommendations } = extractAndParseJSON(data.content || "");
-
-      console.log("[useChat] JSON 解析结果:", { intro, recommendations, hasPlaces: !!data.places });
+      const discussions: DiscussionCard[] = Array.isArray(data.discussions) ? data.discussions : [];
 
       // 处理后端返回的 action 信号
       if (data.action === "load_more") {
-        console.log("[sendMessage] 后端返回 action: load_more，调用 loadMoreRecommendations");
         const excludeIds = recommendedPlacesRef.current.map((p) => p.id);
         await loadMoreRecommendations(allPlacesRef.current, excludeIds);
         return;
       }
-
-      const assistantMessage: ChatMessage & { id: string } = {
-        id: `assistant-${Date.now()}`,
-        role: "assistant",
-        content: intro,
-        recommendations: recommendations,
-      };
 
       // 只有当有 recommendations 时才更新 recommendedPlaces
       // 否则保持为空，让卡片在消息气泡内显示
@@ -1325,18 +2301,29 @@ export function useChat() {
                 pName === rec.id ||
                 rec.id === pName
               ) {
-                console.log("[useChat] 模糊匹配成功:", rec.id, "<->", pName);
                 return { ...p, reason: rec.reason };
               }
             }
 
-            console.log("[useChat] 匹配失败:", rec.id);
             return null;
           })
           .filter((p): p is Place => p !== null);
-
-        console.log("[useChat] 匹配到推荐地点:", newRecommendedPlaces.length);
       }
+
+      const assistantMessageBase: ChatMessage & { id: string } = {
+        id: `assistant-${Date.now()}`,
+        role: "assistant",
+        messageType: "assistant",
+        content: intro || (discussions.length > 0 ? "我整理了几条 Reddit 旅行讨论，先给你看讨论卡。" : ""),
+        placesSnapshot: newRecommendedPlaces,
+        recommendations: recommendations,
+        discussions,
+        createdAt: new Date().toISOString(),
+      };
+      const assistantMessage =
+        session && client && user
+          ? (await appendMessagesToSession(session.id, [assistantMessageBase]))[0] || assistantMessageBase
+          : assistantMessageBase;
 
       // 保存所有地点到 allPlaces（用于"换一批"功能）
       let allPlacesData: Place[] = [];
@@ -1363,20 +2350,14 @@ export function useChat() {
       setState((prev) => ({
         ...prev,
         messages: [...prev.messages, assistantMessage],
-        recommendedPlaces: newRecommendedPlaces,
+        recommendedPlaces: discussions.length > 0 ? [] : newRecommendedPlaces,
         allPlaces: mergePlacesPreservingOrder(prev.allPlaces, allPlacesData),
         nextPageToken: data.nextPageToken || null,
         isLoading: false,
       }));
 
-      // Also try to detect location from AI response
-      if (data.content) {
-        handleLocationUpdate(data.content);
-      }
-      console.log("[sendMessage] 步骤9: 发送成功完成");
     } catch (error: any) {
       if (error.name === "AbortError") {
-        console.log("[sendMessage] AbortError: 请求被取消");
         setState((prev) => ({ ...prev, isLoading: false }));
         return;
       }
@@ -1389,21 +2370,97 @@ export function useChat() {
       }));
     } finally {
       // 确保 isLoading 总是被重置，并触发状态同步
-      console.log("[sendMessage] 步骤10: finally 块执行，确保 isLoading = false");
       setState((prev) => ({ ...prev, isLoading: false }));
     }
-  }, [handleLocationUpdate, searchPlaces]);
+  }, [appendMessagesToSession, buildLocationSwitchedSystemMessage, client, ensureActiveChatSession, geocode, searchPlaces, updateLocation, user]);
 
   const clearMessages = useCallback(() => {
     resetPlaceCursor();
     setState((prev) => ({
       ...prev,
-      messages: [prev.messages[0]],
+      messages: [buildGuestWelcomeMessage()],
       recommendedPlaces: [],
       allPlaces: [],
       nextPageToken: null,
+      activeSessionId: null,
+      hasMoreHistory: false,
+      isHydratingHistory: false,
+      isLoading: false,
+      error: null,
     }));
-  }, []);
+  }, [resetPlaceCursor]);
+
+  const loadOlderMessages = useCallback(async () => {
+    if (!client || !user || state.messages.length === 0) return;
+
+    try {
+      const oldestSession = oldestLoadedSessionRef.current;
+      if (!oldestSession) return;
+
+      const earliest = state.messages[0]?.createdAt;
+      if (!earliest) return;
+
+      const rows = await fetchChatMessagesPage(client, {
+        sessionId: oldestSession.id,
+        limit: OLDER_MESSAGE_PAGE_SIZE,
+        beforeCreatedAt: earliest,
+      });
+
+      let olderMessages = rows.map(deserializeChatMessage);
+      let nextOldestSession = oldestSession;
+      let hasMoreHistory = rows.length >= OLDER_MESSAGE_PAGE_SIZE;
+
+      if (rows.length < OLDER_MESSAGE_PAGE_SIZE && oldestSession.last_message_at) {
+        const previousSession = await getPreviousChatSession(client, {
+          userId: user.id,
+          beforeLastMessageAt: oldestSession.last_message_at,
+          excludeSessionId: oldestSession.id,
+        });
+
+        if (previousSession) {
+          const previousRows = await fetchChatMessagesPage(client, {
+            sessionId: previousSession.id,
+            limit: OLDER_MESSAGE_PAGE_SIZE,
+          });
+          olderMessages = [
+            ...previousRows.map(deserializeChatMessage),
+            ...olderMessages,
+          ];
+          nextOldestSession = previousSession;
+          hasMoreHistory = previousRows.length >= OLDER_MESSAGE_PAGE_SIZE;
+
+          if (!hasMoreHistory && previousSession.last_message_at) {
+            const evenOlderSession = await getPreviousChatSession(client, {
+              userId: user.id,
+              beforeLastMessageAt: previousSession.last_message_at,
+              excludeSessionId: previousSession.id,
+            });
+            hasMoreHistory = !!evenOlderSession;
+          }
+        }
+      }
+
+      if (olderMessages.length === 0) {
+        setState((prev) => ({ ...prev, hasMoreHistory: false }));
+        return;
+      }
+
+      oldestLoadedSessionRef.current = nextOldestSession;
+      setState((prev) => {
+        const mergedMessages = [...olderMessages, ...prev.messages];
+        const { allPlaces, recommendedPlaces } = extractPlacesFromMessages(mergedMessages);
+        return {
+          ...prev,
+          messages: mergedMessages,
+          allPlaces,
+          recommendedPlaces: recommendedPlaces.length > 0 ? recommendedPlaces : prev.recommendedPlaces,
+          hasMoreHistory,
+        };
+      });
+    } catch (error) {
+      console.warn("[chat] Failed to load older messages:", error);
+    }
+  }, [client, state.messages, user]);
 
   const setRecommendedPlaces = useCallback((places: Place[]) => {
     setState((prev) => ({
@@ -1420,6 +2477,23 @@ export function useChat() {
     try {
       setState((prev) => ({ ...prev, isLoading: true }));
 
+      if (process.env.NODE_ENV !== "production") {
+        const fallback = await clientSearchPlaces({
+          textQuery: "restaurant",
+          lat: 0,
+          lng: 0,
+          radius: 5000,
+          nextPageToken: currentToken,
+        });
+        setState((prev) => ({
+          ...prev,
+          recommendedPlaces: [...prev.recommendedPlaces, ...fallback.places],
+          nextPageToken: fallback.nextPageToken,
+          isLoading: false,
+        }));
+        return;
+      }
+
       const response = await fetch("/api/places", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
@@ -1428,23 +2502,6 @@ export function useChat() {
 
       const data = await response.json();
       if (!response.ok) {
-        if (process.env.NODE_ENV !== "production") {
-          console.warn("[Places] Falling back to direct next-page request in development");
-          const fallback = await clientSearchPlaces({
-            textQuery: "restaurant",
-            lat: 0,
-            lng: 0,
-            radius: 5000,
-            nextPageToken: currentToken,
-          });
-          setState((prev) => ({
-            ...prev,
-            recommendedPlaces: [...prev.recommendedPlaces, ...fallback.places],
-            nextPageToken: fallback.nextPageToken,
-            isLoading: false,
-          }));
-          return;
-        }
         throw new Error(data?.error || "Failed to load more places");
       }
 
@@ -1468,20 +2525,17 @@ export function useChat() {
 
   // 换一批：从已有的地点中选择不同的推荐
   const loadMoreRecommendations = useCallback(async (_allPlaces: Place[], _excludeIds: string[]) => {
-    console.log("=== [loadMoreRecommendations] 开始 ===");
     void _allPlaces;
     void _excludeIds;
 
     try {
       // Avoid race conditions from rapid clicking.
       if (loadMoreInFlightRef.current) {
-        console.log("[loadMoreRecommendations] in-flight, ignoring");
         return;
       }
       loadMoreInFlightRef.current = true;
 
       setState((prev) => ({ ...prev, isLoading: true }));
-      console.log("[loadMoreRecommendations] 步骤1: 设置 isLoading = true");
 
       const exhaustionText = "附近评分最高的好店已经全部为您展示完毕啦，换个区域或者搜索词试试吧！(๑˃̵ᴗ˂̵)و";
 
@@ -1537,7 +2591,6 @@ export function useChat() {
         const token = nextPageTokenRef.current;
         if (!token) break;
 
-        console.log("[loadMoreRecommendations] 本地不足，拉取下一页，token:", token);
         const next = await fetchNextPagePlaces(token);
         newlyFetched = newlyFetched.concat(next.places);
         currentAllPlaces = mergeDedupLocal(currentAllPlaces, next.places);
@@ -1560,20 +2613,25 @@ export function useChat() {
       if (batch.length < 5) {
         exhaustedRef.current = true;
         if (batch.length === 0) {
+          const exhaustionMessageBase = {
+            id: `assistant-${Date.now()}`,
+            role: "assistant" as const,
+            messageType: "assistant" as const,
+            content: exhaustionText,
+            createdAt: new Date().toISOString(),
+          };
+          const exhaustionMessage =
+            activeSessionIdRef.current && client && user
+              ? (await appendMessagesToSession(activeSessionIdRef.current, [exhaustionMessageBase]))[0] || exhaustionMessageBase
+              : exhaustionMessageBase;
           setState((prev) => ({
             ...prev,
-            messages: [...prev.messages, {
-              id: `assistant-${Date.now()}`,
-              role: "assistant",
-              content: exhaustionText,
-            }],
+            messages: [...prev.messages, exhaustionMessage],
             isLoading: false,
           }));
           return;
         }
       }
-
-      const assistantId = `assistant-${Date.now()}`;
 
       // Placeholder reasons first; cards render immediately with skeleton UI.
       const immediateReasonMap = new Map<string, string>();
@@ -1589,6 +2647,20 @@ export function useChat() {
         ...p,
         reason: immediateReasonMap.get(p.id) || "",
       }));
+      const refreshMessageBase: ChatMessage & { id: string } = {
+        id: `assistant-${Date.now()}`,
+        role: "assistant",
+        messageType: "assistant",
+        content: `再给你换一批，这次是${batch.length}家：`,
+        placesSnapshot: matchedPlaces,
+        recommendations,
+        createdAt: new Date().toISOString(),
+      };
+      const refreshMessage =
+        activeSessionIdRef.current && client && user
+          ? (await appendMessagesToSession(activeSessionIdRef.current, [refreshMessageBase]))[0] || refreshMessageBase
+          : refreshMessageBase;
+      const assistantId = refreshMessage.id;
 
       // Mark as shown to guarantee global de-dup across repeated clicks when possible.
       const nextShown = new Set(shown);
@@ -1615,12 +2687,7 @@ export function useChat() {
         return {
           ...prev,
           allPlaces: mergedAllPlaces,
-          messages: [...prev.messages, {
-            id: assistantId,
-            role: "assistant",
-            content: `再给你换一批，这次是${batch.length}家：`,
-            recommendations,
-          }],
+          messages: [...prev.messages, refreshMessage],
           recommendedPlaces: matchedPlaces,
           isLoading: false,
         };
@@ -1651,25 +2718,31 @@ export function useChat() {
           return { ...prev, messages: nextMessages, recommendedPlaces: nextRecommendedPlaces };
         });
       })();
-      console.log("[loadMoreRecommendations] 完成：推荐", batch.length, "家；cursor =", placeOffsetRef.current);
 
     } catch (error: any) {
       console.error("[loadMoreRecommendations] 错误:", error);
       // 发生异常时也要确保 UI 更新
+      const errorMessageBase = {
+        id: `assistant-${Date.now()}`,
+        role: "assistant" as const,
+        messageType: "assistant" as const,
+        content: "抱歉，获取推荐时出错了，请稍后再试。",
+        recommendations: [],
+        createdAt: new Date().toISOString(),
+      };
+      const errorMessage =
+        activeSessionIdRef.current && client && user
+          ? (await appendMessagesToSession(activeSessionIdRef.current, [errorMessageBase]))[0] || errorMessageBase
+          : errorMessageBase;
       setState((prev) => ({
         ...prev,
-        messages: [...prev.messages, {
-          id: `assistant-${Date.now()}`,
-          role: "assistant",
-          content: "抱歉，获取推荐时出错了，请稍后再试。",
-          recommendations: [],
-        }],
+        messages: [...prev.messages, errorMessage],
         isLoading: false,
       }));
     } finally {
       loadMoreInFlightRef.current = false;
     }
-  }, [appendPlacesDeduped, fetchNextPagePlaces]); // Keep stable; relies on refs for latest state.
+  }, [appendMessagesToSession, client, fetchNextPagePlaces, user]); // Keep stable; relies on refs for latest state.
 
   return {
     ...state,
@@ -1677,6 +2750,7 @@ export function useChat() {
     clearMessages,
     setRecommendedPlaces,
     searchPlaces,
+    loadOlderMessages,
     loadMorePlaces,
     loadMoreRecommendations,
   };

@@ -17,6 +17,7 @@ async function searchPlaces(params: {
   lng: number;
   radius: number;
   textQuery: string;
+  openNowOnly?: boolean;
 }) {
   const response = await fetch(GOOGLE_PLACES_SEARCH_URL, {
     method: "POST",
@@ -36,6 +37,7 @@ async function searchPlaces(params: {
           radius: params.radius,
         },
       },
+      ...(params.openNowOnly ? { openNow: true } : {}),
       maxResultCount: 20,
     }),
     next: { revalidate: 300 },
@@ -91,6 +93,7 @@ export async function POST(request: NextRequest) {
       keyword,
       textQuery,
       nextPageToken,
+      openNowOnly,
     } = body as {
       lat?: number;
       lng?: number;
@@ -98,6 +101,7 @@ export async function POST(request: NextRequest) {
       keyword?: string;
       textQuery?: string;
       nextPageToken?: string;
+      openNowOnly?: boolean;
     };
 
     if (nextPageToken) {
@@ -115,7 +119,7 @@ export async function POST(request: NextRequest) {
     }
 
     const query = textQuery || keyword || "restaurant";
-    const cacheKey = `places_search_${hashKey({ lat, lng, radius, query })}`;
+    const cacheKey = `places_search_${hashKey({ lat, lng, radius, query, openNowOnly: openNowOnly === true })}`;
     const cached = await getServerCacheJson<Awaited<ReturnType<typeof searchPlaces>>>(cacheKey);
     if (cached) return NextResponse.json(cached);
 
@@ -124,6 +128,7 @@ export async function POST(request: NextRequest) {
       lng,
       radius,
       textQuery: query,
+      openNowOnly: openNowOnly === true,
     });
     await setServerCacheJson({ key: cacheKey, value: result, ttlSeconds: PLACES_CACHE_TTL_SECONDS });
 
