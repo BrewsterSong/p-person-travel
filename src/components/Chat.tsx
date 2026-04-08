@@ -170,21 +170,24 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
   // Show detail drawer when a place is selected
   if (selectedPlace) {
     return (
-      <div className="w-1/2 h-full bg-white flex flex-col">
+      <div className="min-h-0 flex-1 bg-white flex flex-col md:h-full">
         <PlaceDetail place={selectedPlace} onClose={handleCloseDetail} />
       </div>
     );
   }
 
   return (
-    <div className="w-1/2 h-full bg-white flex flex-col">
+    <div className="min-h-0 flex-1 bg-white flex flex-col md:h-full">
       {/* Header */}
-      <div className="h-14 border-b border-gray-200 flex items-center px-4">
-        <h1 className="text-xl font-semibold">P-Person Travel Assistant</h1>
+      <div className="h-12 shrink-0 border-b border-gray-200 flex items-center px-3 md:h-14 md:px-4">
+        <h1 className="text-lg font-semibold md:text-xl">P-Person Travel Assistant</h1>
       </div>
 
       {/* Chat Area */}
-      <div className="flex-1 overflow-y-auto p-4" style={{ scrollbarGutter: "stable" }}>
+      <div
+        className="flex-1 overflow-y-auto overscroll-y-contain p-3 md:p-4"
+        style={{ scrollbarGutter: "stable", WebkitOverflowScrolling: "touch" }}
+      >
         {messages.map((message) => (
           (() => {
             const hasRecs = message.role === "assistant" && message.recommendations && message.recommendations.length > 0;
@@ -213,7 +216,7 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
             className={`flex ${message.role === "user" ? "justify-end" : "justify-start"} mb-4`}
           >
             <div
-              className={`${hasRecs ? "w-full max-w-full" : "max-w-[80%]"} rounded-lg p-3 ${
+              className={`${hasRecs ? "w-full max-w-full" : "max-w-[92%] md:max-w-[80%]"} rounded-lg p-3 ${
                 message.role === "user"
                   ? "bg-blue-500 text-white"
                   : "bg-gray-100 text-gray-800"
@@ -268,10 +271,10 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
                             setHoveredPlace(place);
                             onPlaceHover?.(place);
                           }}
-                          className="w-full flex gap-3 p-2 bg-white rounded-lg cursor-pointer hover:bg-gray-50 transition-colors"
+                          className="w-full flex gap-2 p-2 bg-white rounded-lg cursor-pointer hover:bg-gray-50 transition-colors md:gap-3"
                         >
                           {/* 左侧图片 */}
-                          <div className="w-24 h-24 flex-shrink-0 bg-gray-200 rounded-lg overflow-hidden">
+                          <div className="h-20 w-20 flex-shrink-0 bg-gray-200 rounded-lg overflow-hidden md:h-24 md:w-24">
                             {place.photos && place.photos.length > 0 ? (
                               <img
                                 src={place.photos[0]}
@@ -290,35 +293,35 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
 
                           {/* 右侧内容 */}
                             <div className="flex-1 min-w-0">
-                              <div className="flex items-center gap-2 min-w-0">
-                                <p className="text-sm font-medium text-gray-900 truncate">{place.name}</p>
+                              <div className="flex min-w-0 items-center gap-2">
+                                <p className="min-w-0 flex-1 truncate text-sm font-medium text-gray-900">{place.name}</p>
                                 {place.openNow === true && (
-                                  <span className="inline-flex items-center gap-1 rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
+                                  <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-emerald-50 px-2 py-0.5 text-[11px] font-semibold text-emerald-700">
                                     <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
                                     营业中
                                   </span>
                                 )}
                                 {place.openNow === false && (
-                                  <span className="inline-flex items-center gap-1 rounded-full bg-rose-50 px-2 py-0.5 text-[11px] font-semibold text-rose-700">
+                                  <span className="inline-flex shrink-0 items-center gap-1 whitespace-nowrap rounded-full bg-rose-50 px-2 py-0.5 text-[11px] font-semibold text-rose-700">
                                     <span className="h-1.5 w-1.5 rounded-full bg-rose-500" />
                                     已打烊
                                   </span>
                                 )}
                               </div>
-                              <div className="flex items-center gap-1 mt-1">
-                                <span className="text-yellow-500 text-xs">
+                              <div className="mt-1 flex flex-wrap items-center gap-x-1 gap-y-1">
+                                <span className="text-yellow-500 text-xs leading-none">
                                   {"★".repeat(Math.floor(place.rating))}
                                 </span>
-                                <span className="text-xs text-gray-400">
+                                <span className="text-xs text-gray-400 leading-none">
                                   {place.rating.toFixed(1)} ({place.userRatingsTotal})
                                 </span>
                                 {place.priceLevel && (
-                                  <span className="text-xs text-green-600 ml-1">
+                                  <span className="ml-1 text-xs text-green-600 leading-none">
                                     {"$".repeat(place.priceLevel)}
                                   </span>
                                 )}
                                 {dist && (
-                                  <span className="ml-auto inline-flex items-center gap-1 text-xs text-gray-500 font-medium">
+                                  <span className="inline-flex items-center gap-1 text-xs text-gray-500 font-medium md:ml-auto">
                                     <span aria-hidden>📍</span>
                                     <span>{dist}</span>
                                   </span>
@@ -355,7 +358,7 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
                           loadMoreRecommendations(allPlaces, excludeIds);
                         }}
                         disabled={isLoading}
-                        className="w-full py-3 mt-2 bg-white border border-gray-300 rounded-lg text-sm font-medium text-gray-700 hover:bg-gray-50 disabled:opacity-50 disabled:cursor-not-allowed transition-colors"
+                        className="mt-2 w-full rounded-lg border border-gray-300 bg-white py-3 text-sm font-medium text-gray-700 transition-colors hover:bg-gray-50 disabled:cursor-not-allowed disabled:opacity-50"
                       >
                         {isLoading ? "加载中..." : "换一批"}
                       </button>
@@ -409,19 +412,19 @@ export default function Chat({ onPlaceSelected, onPlaceHover, onMapPlacesChange 
       </div>
 
       {/* Input Area */}
-      <form onSubmit={handleSubmit} className="h-16 border-t border-gray-200 flex items-center px-4 gap-2">
+      <form onSubmit={handleSubmit} className="shrink-0 border-t border-gray-200 flex items-center gap-2 px-3 py-3 md:h-16 md:px-4 md:py-0">
         <input
           type="text"
           value={input}
           onChange={(e) => setInput(e.target.value)}
           placeholder="输入你的位置或需求..."
-          className="flex-1 h-10 px-4 border border-gray-300 rounded-full focus:outline-none focus:border-blue-500"
+          className="h-10 flex-1 min-w-0 rounded-full border border-gray-300 px-4 text-sm focus:outline-none focus:border-blue-500 md:text-base"
           disabled={isLoading}
         />
         <button
           type="submit"
           disabled={!input.trim() || isLoading}
-          className="h-10 px-4 bg-blue-500 text-white rounded-full hover:bg-blue-600 transition-colors disabled:bg-gray-300 disabled:cursor-not-allowed"
+          className="h-10 shrink-0 rounded-full bg-blue-500 px-4 text-sm text-white transition-colors hover:bg-blue-600 disabled:cursor-not-allowed disabled:bg-gray-300 md:text-base"
         >
           发送
         </button>

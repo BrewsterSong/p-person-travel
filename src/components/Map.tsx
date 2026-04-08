@@ -517,8 +517,8 @@ export default function Map({
   // Show empty state when not in service area
   if (!isInServiceArea && location) {
     return (
-      <div className="w-full h-full flex flex-col items-center justify-center bg-gray-100">
-        <div className="w-48 h-48 mb-6 relative">
+      <div className="flex h-full w-full flex-col items-center justify-center bg-gray-100 px-4 py-6 md:px-6 md:py-8">
+        <div className="relative mb-4 h-32 w-32 md:mb-6 md:h-48 md:w-48">
           <svg viewBox="0 0 200 200" className="w-full h-full">
             <circle cx="100" cy="100" r="80" fill="#E5E7EB" />
             <ellipse cx="100" cy="100" rx="80" ry="30" fill="none" stroke="#9CA3AF" strokeWidth="2" />
@@ -531,15 +531,15 @@ export default function Map({
           </svg>
         </div>
 
-        <h3 className="text-xl font-semibold text-gray-800 mb-2">此区域暂不提供服务</h3>
-        <p className="text-gray-600 text-center max-w-xs mb-4">
+        <h3 className="mb-2 text-center text-lg font-semibold text-gray-800 md:text-xl">此区域暂不提供服务</h3>
+        <p className="mb-4 max-w-xs text-center text-sm text-gray-600 md:text-base">
           目前仅支持泰国和日本地区
         </p>
 
-        <div className="bg-white rounded-lg shadow-md p-4 max-w-sm">
-          <p className="text-sm text-gray-600 mb-2">
+        <div className="max-w-sm rounded-lg bg-white p-4 shadow-md">
+          <p className="mb-2 text-sm text-gray-600">
             <span className="font-medium text-blue-600">💡 提示：</span>
-            你可以在右侧对话框输入具体位置来手动定位
+            你可以在下方对话框输入具体位置来手动定位
           </p>
         </div>
       </div>
@@ -553,10 +553,10 @@ export default function Map({
 
       {/* Location indicator */}
       {location && !selectedPlace && (
-        <div className="absolute top-4 left-4 bg-white px-3 py-2 rounded-lg shadow-md text-sm z-10">
+        <div className="absolute left-3 top-3 z-10 max-w-[calc(100%-1.5rem)] rounded-lg bg-white px-3 py-2 text-xs shadow-md md:left-4 md:top-4 md:text-sm">
           <div className="flex items-center gap-2">
             <span className="w-2 h-2 rounded-full bg-green-500" />
-            <span className="text-gray-700">
+            <span className="truncate text-gray-700">
               {location.address || "定位中..."}
             </span>
           </div>
@@ -565,18 +565,18 @@ export default function Map({
 
       {/* Route info overlay */}
       {selectedPlace && location && (
-        <div className="absolute top-4 left-4 right-4 bg-white/85 backdrop-blur-md px-4 py-4 rounded-2xl shadow-lg z-10 border border-white/50">
+        <div className="absolute left-3 right-3 top-3 z-10 rounded-2xl border border-white/50 bg-white/85 px-3 py-3 shadow-lg backdrop-blur-md md:left-4 md:right-4 md:top-4 md:px-4 md:py-4">
           <div className="flex items-start justify-between gap-3">
             <div className="min-w-0">
-              <p className="text-sm text-gray-600 truncate">
+              <p className="truncate text-xs text-gray-600 md:text-sm">
                 我的位置 <span className="text-gray-400 mx-1">→</span> <span className="text-gray-900 font-medium">{selectedPlace.name}</span>
               </p>
               {routeDisplayInfo ? (
-                <p className="mt-1 text-base font-semibold text-gray-900">
+                <p className="mt-1 text-sm font-semibold text-gray-900 md:text-base">
                   {routeDisplayInfo.duration} <span className="text-gray-400 mx-1">·</span> {routeDisplayInfo.distance}
                 </p>
               ) : (
-                <p className="mt-1 text-base font-semibold text-gray-900 animate-pulse">
+                <p className="mt-1 animate-pulse text-sm font-semibold text-gray-900 md:text-base">
                   路线计算中...
                 </p>
               )}
@@ -587,7 +587,7 @@ export default function Map({
           </div>
 
           {/* Segmented control */}
-          <div className="mt-3 p-1 rounded-2xl bg-white/70 border border-gray-200 flex gap-1">
+          <div className="mt-3 flex gap-1 rounded-2xl border border-gray-200 bg-white/70 p-1">
             {(() => {
               const loaded = Object.keys(allRouteInfo).length > 0;
               const canUse = (mode: "DRIVING" | "WALKING" | "TRANSIT") => !loaded || !!allRouteInfo[mode];
@@ -599,7 +599,7 @@ export default function Map({
                 setRouteNotice("");
                 setTravelMode(mode);
               };
-              const btnBase = "flex-1 flex items-center justify-center gap-2 py-2 rounded-xl text-sm font-medium transition-colors border";
+              const btnBase = "flex-1 flex items-center justify-center gap-1 md:gap-2 py-2 rounded-xl text-xs md:text-sm font-medium transition-colors border";
               const btnDisabled = "text-gray-400 cursor-not-allowed border-transparent bg-transparent";
               return (
                 <>
@@ -612,7 +612,7 @@ export default function Map({
                         : (canUse("DRIVING") ? "text-gray-700 hover:bg-white/80 border-transparent" : btnDisabled)
                     }`}
                   >
-                    <span className="text-base">🚗</span>
+                    <span className="text-sm md:text-base">🚗</span>
                     <span>{allRouteInfo.DRIVING?.duration || "驾驶"}</span>
                   </button>
                   <button
@@ -624,7 +624,7 @@ export default function Map({
                         : (canUse("WALKING") ? "text-gray-700 hover:bg-white/80 border-transparent" : btnDisabled)
                     }`}
                   >
-                    <span className="text-base">🚶</span>
+                    <span className="text-sm md:text-base">🚶</span>
                     <span>{allRouteInfo.WALKING?.duration || "步行"}</span>
                   </button>
                   <button
@@ -636,7 +636,7 @@ export default function Map({
                         : (canUse("TRANSIT") ? "text-gray-700 hover:bg-white/80 border-transparent" : btnDisabled)
                     }`}
                   >
-                    <span className="text-base">🚌</span>
+                    <span className="text-sm md:text-base">🚌</span>
                     <span>{allRouteInfo.TRANSIT?.duration || "公交"}</span>
                   </button>
                 </>
@@ -649,7 +649,7 @@ export default function Map({
             href={directionsHref || undefined}
             target="_blank"
             rel="noreferrer"
-            className={`mt-3 w-full inline-flex items-center justify-center gap-2 py-2.5 rounded-xl text-sm font-semibold transition-colors ${
+            className={`mt-3 inline-flex w-full items-center justify-center gap-2 rounded-xl py-2.5 text-sm font-semibold transition-colors ${
               directionsHref ? "bg-blue-600 text-white hover:bg-blue-700" : "bg-gray-200 text-gray-500 pointer-events-none"
             }`}
           >

@@ -8,6 +8,12 @@ interface PlaceDetailProps {
   onClose: () => void;
 }
 
+interface ReviewInsightSummary {
+  pros: string[];
+  cons: string[];
+  bestFor: string[];
+}
+
 const REVIEWS_SUMMARY_CACHE_VERSION = 1;
 const REVIEWS_SUMMARY_NEGATIVE_TTL_MS = 5 * 60 * 1000; // don't retry too aggressively within a session
 
@@ -22,6 +28,15 @@ function buildReviewsSummaryCacheKey(place: Place) {
     (place.reviews || []).map((r) => `${r.authorName || ""}|${String(r.rating ?? "")}|${r.relativeTimeDescription || ""}|${r.text || ""}`) || [];
   const sig = `${place.id}|${parts.join("||")}`;
   return `llm_reviews_summary_v${REVIEWS_SUMMARY_CACHE_VERSION}_${Math.abs(hashString(sig))}`;
+}
+
+function getClientStorage() {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage;
+  } catch {
+    return window.sessionStorage;
+  }
 }
 
 function extractFirstJsonObject(text: string): any | null {
@@ -71,7 +86,7 @@ function extractFirstJsonObject(text: string): any | null {
 
 export default function PlaceDetail({ place, onClose }: PlaceDetailProps) {
   const [hoursOpen, setHoursOpen] = useState(false);
-  const [reviewsSummary, setReviewsSummary] = useState<string>("");
+  const [reviewsSummary, setReviewsSummary] = useState<ReviewInsightSummary | null>(null);
   const [reviewsSummaryLoading, setReviewsSummaryLoading] = useState<boolean>(false);
   const fetchSeq = useRef(0);
 
@@ -105,25 +120,30 @@ export default function PlaceDetail({ place, onClose }: PlaceDetailProps) {
   useEffect(() => {
     const reviews = place.reviews || [];
     if (reviews.length === 0) {
-      setReviewsSummary("");
+      setReviewsSummary(null);
       setReviewsSummaryLoading(false);
       return;
     }
 
     const cacheKey = buildReviewsSummaryCacheKey(place);
     try {
-      const cachedRaw = window.sessionStorage.getItem(cacheKey);
+      const cachedRaw = getClientStorage()?.getItem(cacheKey) ?? window.sessionStorage.getItem(cacheKey);
       if (cachedRaw) {
-        const cached = JSON.parse(cachedRaw) as { v?: number; ok?: boolean; summary?: string; cachedAt?: number } | null;
+        const cached = JSON.parse(cachedRaw) as { v?: number; ok?: boolean; summary?: ReviewInsightSummary | null; cachedAt?: number } | null;
         if (cached && cached.v === REVIEWS_SUMMARY_CACHE_VERSION) {
           const cachedAt = typeof cached.cachedAt === "number" ? cached.cachedAt : 0;
-          if (cached.ok === true && typeof cached.summary === "string" && cached.summary.trim()) {
-            setReviewsSummary(cached.summary);
+          const cachedSummary = cached.summary ?? null;
+          const hasStructuredSummary =
+            cached.ok === true &&
+            cachedSummary &&
+            (cachedSummary.pros?.length || cachedSummary.cons?.length || cachedSummary.bestFor?.length);
+          if (hasStructuredSummary) {
+            setReviewsSummary(cachedSummary);
             setReviewsSummaryLoading(false);
             return;
           }
           if (cached.ok === false && Date.now() - cachedAt < REVIEWS_SUMMARY_NEGATIVE_TTL_MS) {
-            setReviewsSummary("");
+            setReviewsSummary(null);
             setReviewsSummaryLoading(false);
             return;
           }
@@ -134,13 +154,13 @@ export default function PlaceDetail({ place, onClose }: PlaceDetailProps) {
     }
 
     const seq = ++fetchSeq.current;
-    setReviewsSummary("");
+    setReviewsSummary(null);
     setReviewsSummaryLoading(true);
 
     void (async () => {
       try {
         const reviewsContext = reviews
-          .slice(0, 3)
+          .slice(0, 5)
           .map((r, i) => {
             const text = (r.text || "").trim().slice(0, 360);
             const time = (r.relativeTimeDescription || "").trim();
@@ -156,17 +176,19 @@ export default function PlaceDetail({ place, onClose }: PlaceDetailProps) {
             messages: [
               {
                 role: "system",
-                content: `你是一个【用户评价总结引擎】。你的任务是基于我提供的评论文本，写一段自然中文总结。
+                content: `你是一个【用户评价提炼引擎】。你的任务是基于我提供的评论文本，提炼出结构化结论。
 
 评论（唯一信息来源）：
 ${reviewsContext}
 
 严格规则：
 1) 你必须且只能输出合法 JSON，禁止任何 Markdown 或自然语言前后缀。
-2) 输出格式固定为：{"summary":"..."}，只允许这个字段。
-3) summary 写 80-140 字一段自然语言，总结“大家常提到的优点/可能的槽点/适合的人群或场景”。
-4) 禁止编造评论里没有提到的细节（比如招牌菜、服务态度、排队情况、环境氛围等，除非评论文本明确提到）。
-5) 不要复述任何数字（不要写星级、不要写评论数量）。只用“口碑在线/不少人提到/有人吐槽”等非数字表达。`,
+2) 输出格式固定为：{"pros":["..."],"cons":["..."],"bestFor":["..."]}。
+3) 每个字段都是字符串数组；没有内容就返回空数组 []。
+4) 每个数组最多 3 条，每条尽量简短，控制在 8-24 个字。
+5) 只能提炼评论里明确出现的信息；没有提到就不要编造。
+6) pros 表示大家常提到的优点；cons 表示有人提到的问题或风险点；bestFor 表示更适合什么人或什么场景。
+7) 不要复述数字，不要写“评分高/评论很多”这种泛话。`,
               },
               { role: "user", content: "请按要求只返回 JSON。" },
             ],
@@ -176,38 +198,47 @@ ${reviewsContext}
 
         const data = await resp.json();
         const parsed = extractFirstJsonObject(data?.content || "");
-        const summary = typeof parsed?.summary === "string" ? parsed.summary.trim() : "";
+        const normalizeList = (value: unknown): string[] => {
+          if (!Array.isArray(value)) return [];
+          return value
+            .map((item) => (typeof item === "string" ? item.trim() : ""))
+            .filter(Boolean)
+            .slice(0, 3);
+        };
+        const summary: ReviewInsightSummary = {
+          pros: normalizeList(parsed?.pros),
+          cons: normalizeList(parsed?.cons),
+          bestFor: normalizeList(parsed?.bestFor),
+        };
+        const hasStructuredSummary = summary.pros.length > 0 || summary.cons.length > 0 || summary.bestFor.length > 0;
         if (fetchSeq.current !== seq) return;
 
-        if (summary) {
+        if (hasStructuredSummary) {
           setReviewsSummary(summary);
           try {
-            window.sessionStorage.setItem(
-              cacheKey,
-              JSON.stringify({ v: REVIEWS_SUMMARY_CACHE_VERSION, ok: true, summary, cachedAt: Date.now() })
-            );
+            const value = JSON.stringify({ v: REVIEWS_SUMMARY_CACHE_VERSION, ok: true, summary, cachedAt: Date.now() });
+            getClientStorage()?.setItem(cacheKey, value);
+            window.sessionStorage.setItem(cacheKey, value);
           } catch {
             // ignore
           }
         } else {
-          setReviewsSummary("");
+          setReviewsSummary(null);
           try {
-            window.sessionStorage.setItem(
-              cacheKey,
-              JSON.stringify({ v: REVIEWS_SUMMARY_CACHE_VERSION, ok: false, summary: "", cachedAt: Date.now() })
-            );
+            const value = JSON.stringify({ v: REVIEWS_SUMMARY_CACHE_VERSION, ok: false, summary: null, cachedAt: Date.now() });
+            getClientStorage()?.setItem(cacheKey, value);
+            window.sessionStorage.setItem(cacheKey, value);
           } catch {
             // ignore
           }
         }
       } catch {
         if (fetchSeq.current !== seq) return;
-        setReviewsSummary("");
+        setReviewsSummary(null);
         try {
-          window.sessionStorage.setItem(
-            cacheKey,
-            JSON.stringify({ v: REVIEWS_SUMMARY_CACHE_VERSION, ok: false, summary: "", cachedAt: Date.now() })
-          );
+          const value = JSON.stringify({ v: REVIEWS_SUMMARY_CACHE_VERSION, ok: false, summary: null, cachedAt: Date.now() });
+          getClientStorage()?.setItem(cacheKey, value);
+          window.sessionStorage.setItem(cacheKey, value);
         } catch {
           // ignore
         }
@@ -228,13 +259,53 @@ ${reviewsContext}
     return list[mondayIndex] || list[0] || "";
   }, [place.openingHours]);
 
+  const hasReviewsInsight = !!reviewsSummary && (
+    reviewsSummary.pros.length > 0 ||
+    reviewsSummary.cons.length > 0 ||
+    reviewsSummary.bestFor.length > 0
+  );
+
+  const insightSections = [
+    {
+      key: "pros",
+      title: "优点",
+      items: reviewsSummary?.pros || [],
+      tone: "bg-emerald-50 text-emerald-700 border-emerald-100",
+    },
+    {
+      key: "cons",
+      title: "缺点",
+      items: reviewsSummary?.cons || [],
+      tone: "bg-amber-50 text-amber-700 border-amber-100",
+    },
+    {
+      key: "bestFor",
+      title: "适合谁",
+      items: reviewsSummary?.bestFor || [],
+      tone: "bg-sky-50 text-sky-700 border-sky-100",
+    },
+  ].filter((section) => section.items.length > 0);
+
   return (
-    <div className="h-full flex flex-col bg-white">
-      <div className="flex-1 overflow-y-auto">
+    <div className="relative h-full flex flex-col bg-white">
+      <button
+        onClick={onClose}
+        aria-label="Back"
+        className="absolute left-3 top-3 z-20 flex h-10 w-10 items-center justify-center rounded-full border border-white/40 bg-white/80 shadow-lg backdrop-blur-md transition-colors hover:bg-white md:left-4 md:top-4 md:h-11 md:w-11"
+      >
+        <svg className="h-5 w-5 text-gray-900" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
+          <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6" />
+        </svg>
+      </button>
+
+      <div
+        className="flex-1 overflow-y-auto overscroll-y-contain"
+        style={{ WebkitOverflowScrolling: "touch" }}
+      >
         {/* Hero */}
         <div className="relative">
-          <div className="grid grid-cols-3 gap-1 h-64 bg-gray-200">
-            <div className="col-span-2 h-64 overflow-hidden">
+          <div className="grid h-48 grid-cols-3 gap-1 bg-gray-200 md:h-64">
+            <div className="col-span-2 h-48 overflow-hidden md:h-64">
               {photos[0] ? (
                 <img
                   src={photos[0]}
@@ -245,7 +316,7 @@ ${reviewsContext}
                 <div className="w-full h-full bg-gradient-to-br from-gray-200 to-gray-300" />
               )}
             </div>
-            <div className="col-span-1 h-64 grid grid-rows-2 gap-1">
+            <div className="col-span-1 h-48 grid grid-rows-2 gap-1 md:h-64">
               <div className="overflow-hidden">
                 {photos[1] ? (
                   <img
@@ -271,26 +342,16 @@ ${reviewsContext}
             </div>
           </div>
 
-          {/* Floating back button */}
-          <button
-            onClick={onClose}
-            aria-label="Back"
-            className="absolute top-4 left-4 h-11 w-11 rounded-full bg-white/60 backdrop-blur-md border border-white/40 shadow-lg flex items-center justify-center hover:bg-white/75 transition-colors"
-          >
-            <svg className="w-5 h-5 text-gray-900" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2">
-              <path strokeLinecap="round" strokeLinejoin="round" d="M15 18l-6-6 6-6" />
-            </svg>
-          </button>
         </div>
 
         {/* Header info */}
-        <div className="px-5 pt-5">
+        <div className="px-4 pt-4 md:px-5 md:pt-5">
           <div className="flex items-start gap-3">
             <div className="flex-1 min-w-0">
-              <h2 className="text-2xl font-bold text-gray-900 leading-tight break-words">{place.name}</h2>
+              <h2 className="text-xl font-bold leading-tight break-words text-gray-900 md:text-2xl">{place.name}</h2>
 
               <div className="flex flex-wrap items-center gap-2 mt-2">
-                <span className={`inline-flex items-center gap-2 px-2.5 py-1 rounded-full text-sm border ${statusBadge.cls}`}>
+                <span className={`inline-flex items-center gap-2 rounded-full border px-2.5 py-1 text-xs md:text-sm ${statusBadge.cls}`}>
                   <span className={`w-2 h-2 rounded-full ${statusBadge.dot}`} />
                   {statusBadge.label}
                 </span>
@@ -298,7 +359,7 @@ ${reviewsContext}
                   const priceText = getPriceLevel(place.priceLevel);
                   if (!priceText) return null;
                   return (
-                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-sm border bg-gray-50 text-gray-700 border-gray-200">
+                  <span className="inline-flex items-center rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-gray-700 md:text-sm">
                     {priceText}
                   </span>
                   );
@@ -309,14 +370,14 @@ ${reviewsContext}
                   // Guard against unexpected payloads (e.g. empty strings or duplicated place name).
                   if (t.toLowerCase() === (place.name || "").trim().toLowerCase()) return null;
                   return (
-                  <span className="inline-flex items-center px-2.5 py-1 rounded-full text-sm border bg-gray-50 text-gray-700 border-gray-200">
+                  <span className="inline-flex items-center rounded-full border border-gray-200 bg-gray-50 px-2.5 py-1 text-xs text-gray-700 md:text-sm">
                     {t}
                   </span>
                   );
                 })()}
               </div>
 
-              <div className="flex items-center gap-2 mt-3">
+              <div className="mt-3 flex flex-wrap items-center gap-2">
                 <div className="flex items-center text-yellow-400">
                   {"★".repeat(stars.full)}
                   <span className="text-gray-200">
@@ -337,7 +398,7 @@ ${reviewsContext}
 
         {/* AI reviews summary - standalone section (not grouped with address/hours) */}
         {place.reviews && place.reviews.length > 0 && (
-          <div className="px-5 mt-5">
+          <div className="mt-4 px-4 md:mt-5 md:px-5">
             <div className="rounded-2xl bg-gradient-to-br from-slate-50 via-white to-slate-100 border border-slate-200/80 p-4 shadow-sm">
               <div className="flex items-center gap-2">
                 <div className="h-8 w-8 rounded-full bg-slate-100 border border-slate-200 flex items-center justify-center text-slate-700">
@@ -359,9 +420,25 @@ ${reviewsContext}
                   <div className="h-3 rounded bg-slate-200 w-10/12" />
                   <div className="h-3 rounded bg-slate-200 w-8/12" />
                 </div>
-              ) : reviewsSummary ? (
-                <div className="mt-3 text-sm text-slate-700 leading-relaxed">
-                  {reviewsSummary}
+              ) : hasReviewsInsight ? (
+                <div className="mt-4 grid gap-4">
+                  {insightSections.map((section) => (
+                    <div key={section.key}>
+                      <div className="text-[11px] font-semibold tracking-[0.18em] text-slate-400">
+                        {section.title}
+                      </div>
+                      <div className="mt-2 flex flex-wrap gap-2">
+                        {section.items.map((item, index) => (
+                          <span
+                            key={`${section.key}-${index}`}
+                            className={`inline-flex items-center rounded-full border px-3 py-1.5 text-sm font-medium leading-none ${section.tone}`}
+                          >
+                            {item}
+                          </span>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
                 </div>
               ) : (
                 <div className="mt-3 text-sm text-slate-500">
@@ -373,8 +450,8 @@ ${reviewsContext}
         )}
 
         {/* Info cards */}
-        <div className="mt-6 bg-gray-50 border-t border-gray-100">
-          <div className="px-5 py-5">
+        <div className="mt-5 bg-gray-50 border-t border-gray-100 md:mt-6">
+          <div className="px-4 py-4 md:px-5 md:py-5">
             <div className="bg-white rounded-2xl border border-gray-200 p-4">
               <div className="text-sm font-semibold text-gray-900">地址</div>
               <div className="mt-2 text-sm text-gray-700 leading-relaxed">{place.address}</div>
@@ -428,9 +505,9 @@ ${reviewsContext}
         </div>
 
         {/* Reviews */}
-        <div className="px-5 py-6 border-t border-gray-100">
+        <div className="border-t border-gray-100 px-4 py-5 md:px-5 md:py-6">
           <div className="flex items-baseline justify-between">
-            <div className="text-base font-semibold text-gray-900">最新评论</div>
+            <div className="text-base font-semibold text-gray-900">相关评论</div>
             <div className="text-sm text-gray-500">{place.reviews?.length ? `${place.reviews.length} 条` : ""}</div>
           </div>
 

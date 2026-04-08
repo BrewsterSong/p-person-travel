@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import crypto from "crypto";
 import { getGoogleMapsServerApiKey, normalizePlaceSummary } from "@/lib/googlePlaces";
+import { getServerCacheString, setServerCacheString } from "@/lib/serverCache";
 
 const API_KEY = process.env.SILICONFLOW_API_KEY;
 const BASE_URL = process.env.SILICONFLOW_BASE_URL || "https://api.siliconflow.cn/v1";
@@ -16,6 +17,7 @@ type CacheEntry<T> = { value: T; expiresAt: number };
 const LLM_CACHE_TTL_MS = Number(process.env.LLM_CACHE_TTL_MS || 10 * 60 * 1000); // default: 10min
 const LLM_CACHE_MAX = Number(process.env.LLM_CACHE_MAX || 500);
 const llmCache = new Map<string, CacheEntry<unknown>>();
+const inFlightLlmRequests = new Map<string, Promise<string>>();
 
 function hashKey(input: unknown): string {
   return crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex");
@@ -38,6 +40,43 @@ function cacheSet<T>(key: string, value: T, ttlMs: number = LLM_CACHE_TTL_MS) {
     if (firstKey) llmCache.delete(firstKey);
   }
   llmCache.set(key, { value, expiresAt: Date.now() + ttlMs });
+}
+
+async function getOrCreateCachedLlmText(params: {
+  cacheKey: string;
+  ttlMs?: number;
+  producer: () => Promise<string>;
+}): Promise<string> {
+  const { cacheKey, ttlMs = LLM_CACHE_TTL_MS, producer } = params;
+  const cached = cacheGet<string>(cacheKey);
+  if (typeof cached === "string") return cached;
+
+  const sharedCached = await getServerCacheString(cacheKey);
+  if (typeof sharedCached === "string") {
+    cacheSet(cacheKey, sharedCached, ttlMs);
+    return sharedCached;
+  }
+
+  const inFlight = inFlightLlmRequests.get(cacheKey);
+  if (inFlight) return inFlight;
+
+  const promise = (async () => {
+    try {
+      const text = await producer();
+      cacheSet(cacheKey, text, ttlMs);
+      await setServerCacheString({
+        key: cacheKey,
+        value: text,
+        ttlSeconds: Math.max(1, Math.floor(ttlMs / 1000)),
+      });
+      return text;
+    } finally {
+      inFlightLlmRequests.delete(cacheKey);
+    }
+  })();
+
+  inFlightLlmRequests.set(cacheKey, promise);
+  return promise;
 }
 
 function parseJsonLenient(text: string): unknown | null {
@@ -132,9 +171,13 @@ function wantsJsonOutput(messages: unknown[]): boolean {
     const content = typeof record.content === "string" ? record.content : "";
     return (
       content.includes("只输出 JSON") ||
+      content.includes("只返回 JSON") ||
+      content.includes("合法 JSON") ||
+      content.includes("json_object") ||
       content.includes("严格遵循以下输出格式") ||
       content.includes("\"intro\"") ||
-      content.includes("\"places\"")
+      content.includes("\"places\"") ||
+      content.includes("\"summary\"")
     );
   });
 }
@@ -937,32 +980,43 @@ export async function POST(request: NextRequest) {
           content:
             "你是一个无情的 JSON API。你必须且只能输出合法 JSON，禁止任何自然语言、解释、寒暄、Markdown。输出必须以 '{' 开始，以 '}' 结束。",
         };
-        const makeRequest = async (withResponseFormat: boolean) => {
-          const body: Record<string, unknown> = {
-            model: JSON_TASK_MODEL,
-            messages: [strictJsonWrapper, ...messages],
-            temperature: 0,
-            // Reasons are generated for up to ~5 places; allow enough room for 5x(80-120 chars) + JSON.
-            max_tokens: 1200,
-          };
-          // If the provider supports it, this hard-locks output to a JSON object.
-          if (withResponseFormat) body.response_format = { type: "json_object" };
+        const jsonTaskMessages = [strictJsonWrapper, ...messages];
+        const jsonTaskCacheKey = `json_task_${hashKey({
+          model: JSON_TASK_MODEL,
+          messages: jsonTaskMessages,
+        })}`;
+        const content = await getOrCreateCachedLlmText({
+          cacheKey: jsonTaskCacheKey,
+          ttlMs: LLM_CACHE_TTL_MS,
+          producer: async () => {
+            const makeRequest = async (withResponseFormat: boolean) => {
+              const body: Record<string, unknown> = {
+                model: JSON_TASK_MODEL,
+                messages: jsonTaskMessages,
+                temperature: 0,
+                // Reasons are generated for up to ~5 places; allow enough room for 5x(80-120 chars) + JSON.
+                max_tokens: 1200,
+              };
+              // If the provider supports it, this hard-locks output to a JSON object.
+              if (withResponseFormat) body.response_format = { type: "json_object" };
 
-          return fetch(`${BASE_URL}/chat/completions`, {
-            method: "POST",
-            headers: {
-              "Content-Type": "application/json",
-              "Authorization": `Bearer ${API_KEY}`,
-            },
-            body: JSON.stringify(body),
-          });
-        };
+              return fetch(`${BASE_URL}/chat/completions`, {
+                method: "POST",
+                headers: {
+                  "Content-Type": "application/json",
+                  "Authorization": `Bearer ${API_KEY}`,
+                },
+                body: JSON.stringify(body),
+              });
+            };
 
-        // Prefer response_format enforcement; fall back if provider rejects the param.
-        let response = await makeRequest(true);
-        if (!response.ok) response = await makeRequest(false);
-        const data = await response.json();
-        const content = data.choices?.[0]?.message?.content || "";
+            // Prefer response_format enforcement; fall back if provider rejects the param.
+            let response = await makeRequest(true);
+            if (!response.ok) response = await makeRequest(false);
+            const data = await response.json();
+            return data.choices?.[0]?.message?.content || "";
+          },
+        });
         const parsed = extractFirstJsonObject(content);
         console.log("[api/chat] JSON task model =", JSON_TASK_MODEL, "parsedJson =", !!parsed);
         if (!parsed) {

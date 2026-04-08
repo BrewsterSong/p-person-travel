@@ -442,8 +442,11 @@ export interface ChatState {
 }
 
 function buildReasonCacheKey(place: Place) {
-  // Cache is per-place and must be stable across "换一批" and repeated searches in the same session.
-  // Include only fields we allow the copywriter to rely on.
+  // Cache by stable place id so the same place can reuse copy across repeated searches and refreshes.
+  return `llm_reason_v${REASONS_CACHE_VERSION}_${place.id}`;
+}
+
+function buildLegacyReasonCacheKey(place: Place) {
   const sig = [
     place.id,
     place.primaryType || "",
@@ -453,11 +456,26 @@ function buildReasonCacheKey(place: Place) {
   return `llm_reason_v${REASONS_CACHE_VERSION}_${Math.abs(hashString(sig))}`;
 }
 
+function getClientStorage() {
+  if (typeof window === "undefined") return null;
+  try {
+    return window.localStorage;
+  } catch {
+    return window.sessionStorage;
+  }
+}
+
 function getCachedReason(place: Place): string | null {
   try {
     if (typeof window === "undefined") return null;
+    const storage = getClientStorage();
     const key = buildReasonCacheKey(place);
-    const raw = window.sessionStorage.getItem(key);
+    const legacyKey = buildLegacyReasonCacheKey(place);
+    const raw =
+      storage?.getItem(key) ??
+      window.sessionStorage.getItem(key) ??
+      storage?.getItem(legacyKey) ??
+      window.sessionStorage.getItem(legacyKey);
     return raw && typeof raw === "string" ? raw : null;
   } catch {
     return null;
@@ -468,79 +486,75 @@ function setCachedReason(place: Place, reason: string) {
   try {
     if (typeof window === "undefined") return;
     const key = buildReasonCacheKey(place);
+    getClientStorage()?.setItem(key, reason);
     window.sessionStorage.setItem(key, reason);
   } catch {
     // ignore
   }
 }
 
+function humanizePrimaryTypeForReason(t: string): string {
+  const s = (t || "").trim().toLowerCase();
+  if (!s) return "";
+  const map: Record<string, string> = {
+    cafe: "咖啡店",
+    restaurant: "餐厅",
+    yakiniku_restaurant: "烧肉店",
+    japanese_restaurant: "日料店",
+    sushi_restaurant: "寿司店",
+    ramen_restaurant: "拉面店",
+    korean_restaurant: "韩餐",
+    chinese_restaurant: "中餐",
+    italian_restaurant: "意大利餐厅",
+    bar: "酒吧",
+    bakery: "面包店",
+    dessert_shop: "甜品店",
+  };
+  return map[s] || s.replace(/_/g, " ");
+}
+
+function buildFallbackReasonForPlace(p: Place): string {
+  const price = typeof p.priceLevel === "number" && p.priceLevel > 0 ? "$".repeat(p.priceLevel) : "";
+  const typeRaw = (p.primaryType || "").trim();
+  const type = humanizePrimaryTypeForReason(typeRaw);
+  const addr = (p.address || "").trim();
+  const addrShort = addr ? addr.split(",")[0].slice(0, 14) : "";
+
+  const bits: string[] = [];
+  if (type) bits.push(type);
+  if (addrShort) bits.push(`在${addrShort}附近`);
+  if (price) bits.push(`预算大概${price}`);
+
+  const scene =
+    typeRaw && typeRaw.includes("cafe") ? "想歇脚喝咖啡、轻松聊聊天" :
+    typeRaw && typeRaw.includes("yakiniku") ? "想认真吃一顿烧肉，约会或小聚都合适" :
+    type ? `想找${type}类型的一家好店` :
+    "想找一家好店";
+
+  const variants = [
+    {
+      open: "如果你现在就想找一家顺路又不容易踩雷的，",
+      mid: "我会把它放进你的备选里。",
+      close: "点进去看一眼位置和预算范围，合适就可以直接冲。",
+    },
+    {
+      open: "想在附近吃得舒服一点的话，",
+      mid: "这家可以先收藏。",
+      close: "如果你比较挑类型，就按自己的偏好把它和同类对比一下再决定。",
+    },
+    {
+      open: "你要是想快速做决定，",
+      mid: "这家属于值得先点开看看的那种。",
+      close: "我建议你先看下位置是否顺路，再决定要不要排进今晚的行程。",
+    },
+  ];
+  const idx = Math.abs(hashString(p.id || "x")) % variants.length;
+  const core = bits.length ? bits.join("，") : "目前可用信息不多";
+  return `${variants[idx].open}${scene}${variants[idx].mid}${core}。${variants[idx].close}`;
+}
+
 async function generateReasonsForPlaces(places: Place[]): Promise<{ intro: string; recommendations: PlaceRecommendation[] } | null> {
   if (!places || places.length === 0) return null;
-
-  const humanizePrimaryType = (t: string): string => {
-    const s = (t || "").trim().toLowerCase();
-    if (!s) return "";
-    const map: Record<string, string> = {
-      cafe: "咖啡店",
-      restaurant: "餐厅",
-      yakiniku_restaurant: "烧肉店",
-      japanese_restaurant: "日料店",
-      sushi_restaurant: "寿司店",
-      ramen_restaurant: "拉面店",
-      korean_restaurant: "韩餐",
-      chinese_restaurant: "中餐",
-      italian_restaurant: "意大利餐厅",
-      bar: "酒吧",
-      bakery: "面包店",
-      dessert_shop: "甜品店",
-    };
-    return map[s] || s.replace(/_/g, " ");
-  };
-
-  const fallbackReasonFor = (p: Place): string => {
-    // 用户界面已经展示评分/评价数：这里不要复述数字与“评分/评价”等字样。
-    const price = typeof p.priceLevel === "number" && p.priceLevel > 0 ? "$".repeat(p.priceLevel) : "";
-    const typeRaw = (p.primaryType || "").trim();
-    const type = humanizePrimaryType(typeRaw);
-    const addr = (p.address || "").trim();
-    const addrShort = addr ? addr.split(",")[0].slice(0, 14) : "";
-
-    const bits: string[] = [];
-    if (type) bits.push(type);
-    if (addrShort) bits.push(`在${addrShort}附近`);
-    if (price) bits.push(`预算大概${price}`);
-
-    // "种草"语气，但不引入列表外事实。
-    // 仅基于数值与类型做推荐人群/场景推断。
-    const scene =
-      typeRaw && typeRaw.includes("cafe") ? "想歇脚喝咖啡、轻松聊聊天" :
-      typeRaw && typeRaw.includes("yakiniku") ? "想认真吃一顿烧肉，约会或小聚都合适" :
-      type ? `想找${type}类型的一家好店` :
-      "想找一家好店";
-
-    // Add deterministic variation so fallback doesn't read like a rigid template.
-    const variants = [
-      {
-        open: "如果你现在就想找一家顺路又不容易踩雷的，",
-        mid: "我会把它放进你的备选里。",
-        close: "点进去看一眼位置和预算范围，合适就可以直接冲。",
-      },
-      {
-        open: "想在附近吃得舒服一点的话，",
-        mid: "这家可以先收藏。",
-        close: "如果你比较挑类型，就按自己的偏好把它和同类对比一下再决定。",
-      },
-      {
-        open: "你要是想快速做决定，",
-        mid: "这家属于值得先点开看看的那种。",
-        close: "我建议你先看下位置是否顺路，再决定要不要排进今晚的行程。",
-      },
-    ];
-    const idx = Math.abs(hashString(p.id || name || "x")) % variants.length;
-    const core = bits.length ? bits.join("，") : "目前可用信息不多";
-    // 用户界面已经展示店名：文案不要复述店名，保持“自然安利”即可。
-    return `${variants[idx].open}${scene}${variants[idx].mid}${core}。${variants[idx].close}`;
-  };
 
   // Session cache: if we've already generated reasons for these places, reuse immediately.
   const cachedById = new Map<string, string>();
@@ -620,7 +634,7 @@ ${missingListText}
     console.log("[generateReasonsForPlaces] source=fallback places=", places.length);
     // Cache fallback copy too, so we don't repeatedly wait on a failing LLM in this session.
     for (const p of places) {
-      const r = fallbackReasonFor(p);
+      const r = buildFallbackReasonForPlace(p);
       cachedById.set(p.id, r);
       setCachedReason(p, r);
     }
@@ -1173,15 +1187,19 @@ export function useChat() {
                 });
 
           const topPlaces = candidates.slice(0, 5);
+          const immediateReasonMap = new Map<string, string>();
+          for (const p of topPlaces) {
+            immediateReasonMap.set(p.id, getCachedReason(p) || buildFallbackReasonForPlace(p));
+          }
           const intro = preferDistance ? "在你附近先挑了几家更顺路的：" : "为您找到以下几家高分好店：";
 	          const recommendations: PlaceRecommendation[] = topPlaces.map((p) => ({
 	            id: p.id,
-	            reason: "",
+	            reason: immediateReasonMap.get(p.id) || "",
 	          }));
 
 	          const recommendedPlaces: Place[] = topPlaces.map((p) => ({
 	            ...p,
-	            reason: "",
+	            reason: immediateReasonMap.get(p.id) || "",
 	          }));
 
           // 保存所有地点到 allPlaces（用于"换一批"功能）
@@ -1558,8 +1576,19 @@ export function useChat() {
       const assistantId = `assistant-${Date.now()}`;
 
       // Placeholder reasons first; cards render immediately with skeleton UI.
-      const recommendations: PlaceRecommendation[] = batch.map((p) => ({ id: p.id, reason: "" }));
-      const matchedPlaces: Place[] = batch.map((p) => ({ ...p, reason: "" }));
+      const immediateReasonMap = new Map<string, string>();
+      for (const p of batch) {
+        immediateReasonMap.set(p.id, getCachedReason(p) || buildFallbackReasonForPlace(p));
+      }
+
+      const recommendations: PlaceRecommendation[] = batch.map((p) => ({
+        id: p.id,
+        reason: immediateReasonMap.get(p.id) || "",
+      }));
+      const matchedPlaces: Place[] = batch.map((p) => ({
+        ...p,
+        reason: immediateReasonMap.get(p.id) || "",
+      }));
 
       // Mark as shown to guarantee global de-dup across repeated clicks when possible.
       const nextShown = new Set(shown);

@@ -115,7 +115,7 @@ export function normalizePlaceDetails(
   const editorialSummary = details.editorialSummary as Record<string, unknown> | undefined;
   const detailPhotos = normalizePhotoUrls(details.photos, 800).slice(0, 5);
   const reviews = Array.isArray(details.reviews)
-    ? (details.reviews as Record<string, unknown>[]).slice(0, 3).map(normalizeReview)
+    ? (details.reviews as Record<string, unknown>[]).slice(0, 5).map(normalizeReview)
     : fallbackReviews;
 
   return {

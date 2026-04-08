@@ -1,9 +1,16 @@
 import { NextRequest, NextResponse } from "next/server";
+import crypto from "crypto";
 import { getGoogleMapsServerApiKey, normalizePlaceSummary } from "@/lib/googlePlaces";
+import { getServerCacheJson, setServerCacheJson } from "@/lib/serverCache";
 
 const GOOGLE_PLACES_SEARCH_URL = "https://places.googleapis.com/v1/places:searchText";
 const FIELD_MASK =
   "places.id,places.displayName,places.formattedAddress,places.location,places.rating,places.userRatingCount,places.priceLevel,places.currentOpeningHours,places.photos,places.primaryType,places.types,nextPageToken";
+const PLACES_CACHE_TTL_SECONDS = 10 * 60;
+
+function hashKey(input: unknown) {
+  return crypto.createHash("sha256").update(JSON.stringify(input)).digest("hex");
+}
 
 async function searchPlaces(params: {
   lat: number;
@@ -94,7 +101,12 @@ export async function POST(request: NextRequest) {
     };
 
     if (nextPageToken) {
+      const cacheKey = `places_next_${hashKey({ nextPageToken })}`;
+      const cached = await getServerCacheJson<Awaited<ReturnType<typeof getNextPage>>>(cacheKey);
+      if (cached) return NextResponse.json(cached);
+
       const result = await getNextPage(nextPageToken);
+      await setServerCacheJson({ key: cacheKey, value: result, ttlSeconds: PLACES_CACHE_TTL_SECONDS });
       return NextResponse.json(result);
     }
 
@@ -102,12 +114,18 @@ export async function POST(request: NextRequest) {
       return NextResponse.json({ error: "Location is required" }, { status: 400 });
     }
 
+    const query = textQuery || keyword || "restaurant";
+    const cacheKey = `places_search_${hashKey({ lat, lng, radius, query })}`;
+    const cached = await getServerCacheJson<Awaited<ReturnType<typeof searchPlaces>>>(cacheKey);
+    if (cached) return NextResponse.json(cached);
+
     const result = await searchPlaces({
       lat,
       lng,
       radius,
-      textQuery: textQuery || keyword || "restaurant",
+      textQuery: query,
     });
+    await setServerCacheJson({ key: cacheKey, value: result, ttlSeconds: PLACES_CACHE_TTL_SECONDS });
 
     return NextResponse.json(result);
   } catch (error: unknown) {
