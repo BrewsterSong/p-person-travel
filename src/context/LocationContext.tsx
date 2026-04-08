@@ -1,10 +1,10 @@
 "use client";
 
 import { createContext, useContext, ReactNode } from "react";
-import { useLocation, Location, LocationState } from "@/hooks/useLocation";
+import { useLocation, Location, LocationState, UpdateLocationOptions } from "@/hooks/useLocation";
 
 interface LocationContextType extends LocationState {
-  updateLocation: (location: Location) => Promise<void>;
+  updateLocation: (location: Location, options?: UpdateLocationOptions) => Promise<void>;
   geocode: (address: string) => Promise<Location | null>;
   detectMultipleLocations: (address: string) => Promise<Location[]>;
   defaultLocation: Location;

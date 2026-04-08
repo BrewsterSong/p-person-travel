@@ -18,13 +18,6 @@ export default function Home() {
   const [isDesktop, setIsDesktop] = useState(false);
   const containerRef = useRef<HTMLDivElement>(null);
 
-  // Log whenever selectedPlace changes
-  const prevSelectedPlaceRef = useRef<string | null>(null);
-  if (selectedPlace?.name !== prevSelectedPlaceRef.current) {
-    console.log("[Home] selectedPlace changed to:", selectedPlace?.name || null);
-    prevSelectedPlaceRef.current = selectedPlace?.name || null;
-  }
-
   // Clear route when no place is selected
   const handlePlaceSelected = useCallback((place: Place | null) => {
     // This is handled by Map component now

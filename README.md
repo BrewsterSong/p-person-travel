@@ -277,7 +277,12 @@ npm install
 SILICONFLOW_API_KEY=
 GOOGLE_MAPS_API_KEY=
 NEXT_PUBLIC_GOOGLE_MAPS_API_KEY=
+SERPAPI_KEY=
 ```
+
+说明：
+
+- `SERPAPI_KEY`：SerpApi 的 API Key，用于通过 Google `site:reddit.com` 做 Reddit 内容发现。
 
 3. 启动开发服务器
 
@@ -289,3 +294,25 @@ npm run dev
 
 http://localhost:3000
 
+## Reddit 旅行讨论 Demo
+
+本项目新增了一套最小可用的 Reddit 旅行讨论接入：
+
+- `GET /api/reddit/search?query=Kyoto%20itinerary`
+- `GET /api/reddit/detail?url=https://www.reddit.com/r/...`
+- `GET /api/reddit/comments?url=https://www.reddit.com/r/...&limit=3`
+
+聊天里也支持直接触发讨论卡，例如：
+
+- `Bangkok`
+- `Shibuya`
+- `Kyoto itinerary`
+- `where to stay in Osaka`
+
+然后执行：
+
+```bash
+npm test
+```
+
+可验证 Reddit 发现层 query builder 与 discussion 映射的最小测试。

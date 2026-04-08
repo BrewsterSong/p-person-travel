@@ -3,7 +3,9 @@ import { Place, Review } from "@/types/chat";
 type GooglePlaceLike = Record<string, unknown>;
 
 const SERVER_GOOGLE_MAPS_API_KEY =
-  process.env.GOOGLE_MAPS_API_KEY || "";
+  process.env.GOOGLE_MAPS_API_KEY ||
+  process.env.NEXT_PUBLIC_GOOGLE_MAPS_API_KEY ||
+  "";
 
 export function getGoogleMapsServerApiKey(): string {
   if (!SERVER_GOOGLE_MAPS_API_KEY) {

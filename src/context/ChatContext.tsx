@@ -8,6 +8,7 @@ interface ChatContextType extends ChatState {
   sendMessage: (content: string) => Promise<void>;
   clearMessages: () => void;
   setRecommendedPlaces: (places: Place[]) => void;
+  loadOlderMessages: () => Promise<void>;
   loadMorePlaces: () => Promise<void>;
   loadMoreRecommendations: (allPlaces: Place[], excludeIds: string[]) => Promise<void>;
 }
