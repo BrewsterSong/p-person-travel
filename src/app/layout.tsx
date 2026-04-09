@@ -1,10 +1,35 @@
 import type { Metadata } from "next";
 import "./globals.css";
 import { Providers } from "./providers";
+import { siteConfig } from "@/lib/site";
 
 export const metadata: Metadata = {
-  title: "P-Person Travel - AI Travel Assistant",
-  description: "Real-time dining recommendations and instant routes for spontaneous travelers",
+  metadataBase: new URL(siteConfig.url),
+  title: {
+    default: `${siteConfig.name} | AI Travel Assistant`,
+    template: `%s | ${siteConfig.name}`,
+  },
+  description: siteConfig.description,
+  alternates: {
+    canonical: "/",
+  },
+  openGraph: {
+    type: "website",
+    url: siteConfig.url,
+    siteName: siteConfig.name,
+    title: `${siteConfig.name} | AI Travel Assistant`,
+    description: siteConfig.description,
+    locale: "en_US",
+  },
+  twitter: {
+    card: "summary_large_image",
+    title: `${siteConfig.name} | AI Travel Assistant`,
+    description: siteConfig.description,
+  },
+  robots: {
+    index: true,
+    follow: true,
+  },
 };
 
 export default function RootLayout({
