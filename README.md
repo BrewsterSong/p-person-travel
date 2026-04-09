@@ -1,4 +1,4 @@
-# P-Person Travel Assistant
+# Here & Go
 
 一个为 **“不想提前做攻略的人”** 设计的 AI 即时旅行助手。
 
@@ -15,7 +15,7 @@
 
 ## Live Demo
 
-https://p-person-travel.vercel.app
+https://www.hereandgo.com
 
 ---
 
