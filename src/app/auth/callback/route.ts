@@ -11,7 +11,12 @@ export async function GET(request: Request) {
 
   if (code && isSupabaseServerConfigured()) {
     const supabase = await createSupabaseServerClient();
-    await supabase.auth.exchangeCodeForSession(code);
+    const { error } = await supabase.auth.exchangeCodeForSession(code);
+
+    if (error) {
+      console.error("[auth] Failed to exchange OAuth code for session:", error);
+      return NextResponse.redirect(new URL("/?auth_error=callback_failed", url.origin));
+    }
   }
 
   return NextResponse.redirect(new URL(next, url.origin));

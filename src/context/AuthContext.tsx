@@ -152,7 +152,7 @@ export function AuthProvider({ children }: { children: ReactNode }) {
 
     const redirectTo =
       typeof window !== "undefined"
-        ? `${window.location.origin}/auth/callback?next=/`
+        ? `${window.location.origin}/auth/callback`
         : undefined;
 
     const { error } = await client.auth.signInWithOAuth({
